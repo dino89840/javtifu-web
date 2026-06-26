@@ -1,16 +1,31 @@
-const TARGET_HOST = "javtiful.com";
+// ============================================================
+//  Cloudflare Pages Function — _worker.js  (functions/_worker.js)
+//  javtiful.com proxy  ·  Fixed: images + R2 signed video URLs
+// ============================================================
+
+const TARGET_HOST   = "javtiful.com";
 const TARGET_ORIGIN = `https://${TARGET_HOST}`;
-const PROXY_PATH = "/__proxy";
+const PROXY_PATH    = "/__proxy";
 
 const ALLOW_ANY_EXTERNAL_HOST = true;
 
+// ✅ FIX 1: CDN/player hosts whitelist — ad filter မှ ကျော်သွားစေ
+const CDN_WHITELIST_HOSTS = new Set([
+  "sspark.genspark.ai",
+  "cdn.plyr.io",
+  "vjs.zencdn.net",
+  "cdnjs.cloudflare.com",
+  "cdn.jsdelivr.net",
+  "www.googletagmanager.com",   // gtag script — block မလုပ်
+  "www.google-analytics.com",   // analytics — block မလုပ်
+]);
+
 const ALLOWED_HOST_SUFFIXES = [
   TARGET_HOST,
-  `www.${TARGET_HOST}`
+  `www.${TARGET_HOST}`,
 ];
 
 const AD_KEYWORDS = [
-  "ads",
   "adserver",
   "adsterra",
   "juicyads",
@@ -20,8 +35,8 @@ const AD_KEYWORDS = [
   "popunder",
   "doubleclick",
   "googlesyndication",
-  "google-analytics",
-  "googletagmanager",
+  // ✅ FIX: google-analytics / googletagmanager ဖယ်ထုတ်
+  //   → site ၏ plyr/player script တွေ break မဖြစ်အောင်
   "histats",
   "trafficjunky",
   "trafficfactory",
@@ -32,40 +47,45 @@ const AD_KEYWORDS = [
   "revcontent",
   "mgid",
   "taboola",
-  "outbrain"
+  "outbrain",
 ];
 
 const REWRITE_ATTRS = [
-  "href",
-  "src",
-  "action",
-  "poster",
-  "data-src",
-  "data-href",
-  "data-url",
-  "data-original",
-  "data-poster",
-  "data-lazy",
-  "data-image",
-  "data-thumb"
+  "href", "src", "action", "poster",
+  "data-src", "data-href", "data-url",
+  "data-original", "data-poster", "data-lazy",
+  "data-image", "data-thumb",
 ];
 
+// ✅ FIX 2: R2/S3 presigned URL detection
+//   X-Amz-Signature ပါသော URL → proxy မဖြတ်ဘဲ direct access ပေး
+function isSignedUrl(url) {
+  const u = url instanceof URL ? url : null;
+  if (!u) return false;
+  return (
+    u.searchParams.has("X-Amz-Signature") ||
+    u.searchParams.has("x-amz-signature") ||
+    u.searchParams.has("Signature") ||           // older S3
+    (u.searchParams.has("X-Amz-Expires") &&
+     u.searchParams.has("X-Amz-Credential"))
+  );
+}
+
+// ============================================================
+//  Main request handler
+// ============================================================
 export async function onRequest(context) {
-  const request = context.request;
+  const request     = context.request;
   const incomingUrl = new URL(request.url);
 
   if (request.method === "OPTIONS") {
-    return new Response(null, {
-      status: 204,
-      headers: corsHeaders()
-    });
+    return new Response(null, { status: 204, headers: corsHeaders() });
   }
 
   let targetUrl;
-
   try {
     targetUrl = getTargetUrl(incomingUrl);
-  } catch (err) {
+  } catch {
     return new Response("Bad proxy URL", { status: 400 });
   }
 
@@ -77,53 +97,57 @@ export async function onRequest(context) {
     return emptyBlockedResponse();
   }
 
+  // ✅ FIX 3: R2 signed URL → direct 302 redirect
+  //   Proxy worker ကနေ ဖြတ်မသွားဘဲ browser ကို တိုက်ရိုက် R2 URL ပို့
+  if (isSignedUrl(targetUrl)) {
+    return Response.redirect(targetUrl.toString(), 302);
+  }
+
   const upstreamHeaders = buildRequestHeaders(request, targetUrl);
-
   const fetchInit = {
-    method: request.method,
-    headers: upstreamHeaders,
-    redirect: "manual"
+    method:   request.method,
+    headers:  upstreamHeaders,
+    redirect: "manual",
   };
-
   if (request.method !== "GET" && request.method !== "HEAD") {
     fetchInit.body = request.body;
   }
 
   let upstreamResponse;
-
   try {
     upstreamResponse = await fetch(targetUrl.toString(), fetchInit);
   } catch (err) {
     return new Response(`Proxy fetch error: ${err.message}`, {
       status: 502,
-      headers: corsHeaders()
+      headers: corsHeaders(),
     });
   }
 
+  // ── Redirect ─────────────────────────────────────────────────────────────
   if (isRedirect(upstreamResponse.status)) {
     const location = upstreamResponse.headers.get("location");
-    const headers = buildResponseHeaders(upstreamResponse.headers, incomingUrl.host, false);
+    const headers  = buildResponseHeaders(upstreamResponse.headers, incomingUrl.host, false);
 
     if (location) {
-      const absoluteLocation = safeResolveUrl(location, targetUrl);
-      if (absoluteLocation && isAllowedUrl(absoluteLocation)) {
-        headers.set("location", proxifyUrl(absoluteLocation, incomingUrl));
+      const abs = safeResolveUrl(location, targetUrl);
+      if (abs) {
+        // ✅ FIX: Redirect が signed URL なら direct
+        if (isSignedUrl(abs)) {
+          headers.set("location", abs.toString());
+        } else if (isAllowedUrl(abs)) {
+          headers.set("location", proxifyUrl(abs, incomingUrl));
+        }
       }
     }
-
-    return new Response(null, {
-      status: upstreamResponse.status,
-      headers
-    });
+    return new Response(null, { status: upstreamResponse.status, headers });
   }
 
   const contentType = upstreamResponse.headers.get("content-type") || "";
-  const pathname = targetUrl.pathname.toLowerCase();
+  const pathname    = targetUrl.pathname.toLowerCase();
 
-  // ── HTML ──────────────────────────────────────────────────────────────────
+  // ── HTML ─────────────────────────────────────────────────────────────────
   if (contentType.includes("text/html")) {
     let html = await upstreamResponse.text();
-
     html = removeAdBlocksFromHtml(html);
     html = rewriteTextUrls(html, targetUrl, incomingUrl);
     html = injectAntiAdCss(html);
@@ -132,23 +156,20 @@ export async function onRequest(context) {
     const headers = buildResponseHeaders(upstreamResponse.headers, incomingUrl.host, true);
     headers.set("content-type", "text/html; charset=UTF-8");
 
-    const responseForRewrite = new Response(html, {
-      status: upstreamResponse.status,
-      headers
-    });
+    const resp = new Response(html, { status: upstreamResponse.status, headers });
 
     return new HTMLRewriter()
       .on("script, iframe, embed, object", new RemoveAdElementHandler(targetUrl))
       .on(
         "a, link, img, script, iframe, source, video, audio, form, embed, object, track",
-        new AttrRewriteHandler(targetUrl, incomingUrl)
+        new AttrRewriteHandler(targetUrl, incomingUrl),
       )
-      .on("[style]", new StyleAttrRewriteHandler(targetUrl, incomingUrl))
-      .on("noscript", new NoscriptRewriteHandler(targetUrl, incomingUrl))
-      .transform(responseForRewrite);
+      .on("[style]",   new StyleAttrRewriteHandler(targetUrl, incomingUrl))
+      .on("noscript",  new NoscriptRewriteHandler(targetUrl, incomingUrl))
+      .transform(resp);
   }
 
-  // ── HLS m3u8 ──────────────────────────────────────────────────────────────
+  // ── HLS m3u8 ─────────────────────────────────────────────────────────────
   if (
     contentType.includes("application/vnd.apple.mpegurl") ||
     contentType.includes("application/x-mpegurl") ||
@@ -159,14 +180,10 @@ export async function onRequest(context) {
 
     const headers = buildResponseHeaders(upstreamResponse.headers, incomingUrl.host, true);
     headers.set("content-type", "application/vnd.apple.mpegurl; charset=UTF-8");
-
-    return new Response(playlist, {
-      status: upstreamResponse.status,
-      headers
-    });
+    return new Response(playlist, { status: upstreamResponse.status, headers });
   }
 
-  // ── CSS ───────────────────────────────────────────────────────────────────
+  // ── CSS ──────────────────────────────────────────────────────────────────
   if (contentType.includes("text/css") || pathname.endsWith(".css")) {
     let css = await upstreamResponse.text();
     css = rewriteCssUrls(css, targetUrl, incomingUrl);
@@ -174,14 +191,10 @@ export async function onRequest(context) {
 
     const headers = buildResponseHeaders(upstreamResponse.headers, incomingUrl.host, true);
     headers.set("content-type", "text/css; charset=UTF-8");
-
-    return new Response(css, {
-      status: upstreamResponse.status,
-      headers
-    });
+    return new Response(css, { status: upstreamResponse.status, headers });
   }
 
-  // ── JS / JSON / XML / text ────────────────────────────────────────────────
+  // ── JS / JSON / text ─────────────────────────────────────────────────────
   if (
     contentType.includes("javascript") ||
     contentType.includes("application/json") ||
@@ -196,53 +209,51 @@ export async function onRequest(context) {
     if (!isVideoPlayerScript(targetUrl.pathname)) {
       text = removeAdCodeFromText(text);
     }
-    text = rewriteTextUrls(text, targetUrl, incomingUrl);
+
+    // ✅ FIX 4: JSON response ထဲ R2 signed URL ပါနိုင်သောကြောင့်
+    //   rewriteTextUrls မလုပ်ဘဲ JSON-aware rewrite သုံး
+    if (
+      contentType.includes("application/json") ||
+      pathname.endsWith(".json")
+    ) {
+      text = rewriteJsonTextSafe(text, targetUrl, incomingUrl);
+    } else {
+      text = rewriteTextUrls(text, targetUrl, incomingUrl);
+    }
 
     const headers = buildResponseHeaders(upstreamResponse.headers, incomingUrl.host, true);
-
-    return new Response(text, {
-      status: upstreamResponse.status,
-      headers
-    });
+    return new Response(text, { status: upstreamResponse.status, headers });
   }
 
-  // ── Binary ────────────────────────────────────────────────────────────────
+  // ── Binary ───────────────────────────────────────────────────────────────
   const headers = buildResponseHeaders(upstreamResponse.headers, incomingUrl.host, false);
-
   return new Response(upstreamResponse.body, {
-    status: upstreamResponse.status,
+    status:     upstreamResponse.status,
     statusText: upstreamResponse.statusText,
-    headers
+    headers,
   });
 }
 
-/* =========================
-   URL / Proxy helpers
-========================= */
-
+// ============================================================
+//  URL helpers
+// ============================================================
 function getTargetUrl(incomingUrl) {
   if (incomingUrl.pathname === PROXY_PATH) {
     const raw = incomingUrl.searchParams.get("url");
     if (!raw) throw new Error("Missing url parameter");
-
     const decoded = decodeURIComponent(raw);
-    const target = new URL(decoded);
-
+    const target  = new URL(decoded);
     if (target.protocol !== "http:" && target.protocol !== "https:") {
       throw new Error("Invalid protocol");
     }
-
     return target;
   }
-
   return new URL(incomingUrl.pathname + incomingUrl.search, TARGET_ORIGIN);
 }
 
 function safeResolveUrl(value, baseUrl) {
   if (!value) return null;
-
   const trimmed = value.trim();
-
   if (
     trimmed.startsWith("#") ||
     trimmed.startsWith("javascript:") ||
@@ -250,10 +261,7 @@ function safeResolveUrl(value, baseUrl) {
     trimmed.startsWith("mailto:") ||
     trimmed.startsWith("tel:") ||
     trimmed.startsWith("blob:")
-  ) {
-    return null;
-  }
-
+  ) return null;
   try {
     return new URL(trimmed, baseUrl);
   } catch {
@@ -264,20 +272,23 @@ function safeResolveUrl(value, baseUrl) {
 function proxifyUrl(targetUrl, incomingUrl) {
   const u = targetUrl instanceof URL ? targetUrl : new URL(targetUrl);
 
-  if (isAdUrl(u)) {
-    return "about:blank";
-  }
+  if (isAdUrl(u)) return "about:blank";
+
+  // ✅ FIX: signed URL → direct (proxy မဖြတ်)
+  if (isSignedUrl(u)) return u.toString();
 
   if (isTargetHost(u.hostname)) {
     return `${u.pathname}${u.search}${u.hash}`;
   }
-
   return `${PROXY_PATH}?url=${encodeURIComponent(u.toString())}`;
 }
 
 function rewriteOneUrl(value, baseTargetUrl, incomingUrl) {
   const absolute = safeResolveUrl(value, baseTargetUrl);
   if (!absolute) return value;
+
+  // ✅ FIX: signed URL → そのまま返す
+  if (isSignedUrl(absolute)) return absolute.toString();
 
   if (!isAllowedUrl(absolute)) return "about:blank";
   return proxifyUrl(absolute, incomingUrl);
@@ -288,33 +299,30 @@ function isTargetHost(hostname) {
 }
 
 function isAllowedUrl(url) {
-  if (!url || (url.protocol !== "http:" && url.protocol !== "https:")) {
-    return false;
-  }
+  if (!url || (url.protocol !== "http:" && url.protocol !== "https:")) return false;
+  if (isAdUrl(url)) return false;
+  if (isTargetHost(url.hostname)) return true;
 
-  if (isAdUrl(url)) {
-    return false;
-  }
-
-  if (isTargetHost(url.hostname)) {
-    return true;
-  }
+  // CDN whitelist → always allow
+  if (CDN_WHITELIST_HOSTS.has(url.hostname)) return true;
 
   for (const suffix of ALLOWED_HOST_SUFFIXES) {
-    if (url.hostname === suffix || url.hostname.endsWith(`.${suffix}`)) {
-      return true;
-    }
+    if (url.hostname === suffix || url.hostname.endsWith(`.${suffix}`)) return true;
   }
-
   return ALLOW_ANY_EXTERNAL_HOST;
 }
 
 function isAdUrl(url) {
   if (!url) return false;
 
-  const value = `${url.hostname}${url.pathname}${url.search}`.toLowerCase();
+  const hostname = (url.hostname || "").toLowerCase();
 
-  return AD_KEYWORDS.some((keyword) => value.includes(keyword.toLowerCase()));
+  // ✅ FIX: CDN whitelist → ad check bypass
+  if (CDN_WHITELIST_HOSTS.has(hostname)) return false;
+
+  // hostname ကိုသာ AD_KEYWORDS စစ် (path/query မစစ်)
+  // → sspark.genspark.ai?u1=...ads... ကဲ့သို့ query ထဲ "ads" ပါသော CDN မ block ဖြစ်စေ
+  return AD_KEYWORDS.some((kw) => hostname.includes(kw.toLowerCase()));
 }
 
 function isRedirect(status) {
@@ -336,13 +344,11 @@ function isVideoPlayerScript(pathname) {
   );
 }
 
-/* =========================
-   Headers
-========================= */
-
+// ============================================================
+//  Headers
+// ============================================================
 function buildRequestHeaders(request, targetUrl) {
   const headers = new Headers(request.headers);
-
   headers.delete("host");
   headers.delete("content-length");
   headers.delete("accept-encoding");
@@ -351,23 +357,19 @@ function buildRequestHeaders(request, targetUrl) {
   headers.delete("cf-ray");
   headers.delete("x-forwarded-for");
   headers.delete("x-forwarded-proto");
-
   headers.set("referer", `${targetUrl.origin}/`);
-  headers.set("origin", targetUrl.origin);
-
+  headers.set("origin",  targetUrl.origin);
   if (!headers.get("user-agent")) {
     headers.set(
       "user-agent",
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36"
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36",
     );
   }
-
   return headers;
 }
 
 function buildResponseHeaders(upstreamHeaders, proxyHost, modifiedBody) {
   const headers = new Headers(upstreamHeaders);
-
   headers.delete("content-security-policy");
   headers.delete("content-security-policy-report-only");
   headers.delete("x-frame-options");
@@ -384,22 +386,17 @@ function buildResponseHeaders(upstreamHeaders, proxyHost, modifiedBody) {
 
   rewriteSetCookieHeaders(headers);
 
-  const cors = corsHeaders();
-  for (const [k, v] of cors.entries()) {
-    headers.set(k, v);
-  }
-
+  for (const [k, v] of corsHeaders().entries()) headers.set(k, v);
   headers.set("x-proxy-by", "cloudflare-pages-function");
-
   return headers;
 }
 
 function corsHeaders() {
   return new Headers({
-    "access-control-allow-origin": "*",
-    "access-control-allow-methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
-    "access-control-allow-headers": "*",
-    "access-control-expose-headers": "*"
+    "access-control-allow-origin":   "*",
+    "access-control-allow-methods":  "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+    "access-control-allow-headers":  "*",
+    "access-control-expose-headers": "*",
   });
 }
 
@@ -407,16 +404,13 @@ function rewriteSetCookieHeaders(headers) {
   if (typeof headers.getSetCookie === "function") {
     const cookies = headers.getSetCookie();
     headers.delete("set-cookie");
-
     for (let cookie of cookies) {
       cookie = cookie.replace(/;\s*Domain=[^;]+/gi, "");
-      cookie = cookie.replace(/;\s*Secure/gi, "; Secure");
+      cookie = cookie.replace(/;\s*Secure/gi,       "; Secure");
       headers.append("set-cookie", cookie);
     }
-
     return;
   }
-
   const cookie = headers.get("set-cookie");
   if (cookie) {
     headers.set("set-cookie", cookie.replace(/;\s*Domain=[^;]+/gi, ""));
@@ -424,39 +418,28 @@ function rewriteSetCookieHeaders(headers) {
 }
 
 function emptyBlockedResponse() {
-  return new Response("", {
-    status: 204,
-    headers: corsHeaders()
-  });
+  return new Response("", { status: 204, headers: corsHeaders() });
 }
 
-/* =========================
-   HTMLRewriter handlers
-========================= */
-
+// ============================================================
+//  HTMLRewriter handlers
+// ============================================================
 class RemoveAdElementHandler {
-  constructor(baseTargetUrl) {
-    this.baseTargetUrl = baseTargetUrl;
-  }
+  constructor(baseTargetUrl) { this.baseTargetUrl = baseTargetUrl; }
 
   element(element) {
-    const attrs = ["src", "href", "data-src", "data-url"];
-
-    for (const attr of attrs) {
+    for (const attr of ["src", "href", "data-src", "data-url"]) {
       const value = element.getAttribute(attr);
       if (!value) continue;
 
-      const absolute = safeResolveUrl(value, this.baseTargetUrl);
-      if (absolute && isAdUrl(absolute)) {
-        element.remove();
-        return;
-      }
+      // pipe format → ပထမ part ကိုသာ စစ်
+      const checkVal = value.includes("|") ? value.split("|")[0].trim() : value;
+      const absolute = safeResolveUrl(checkVal, this.baseTargetUrl);
 
-      const lower = value.toLowerCase();
-      if (AD_KEYWORDS.some((keyword) => lower.includes(keyword))) {
-        element.remove();
-        return;
-      }
+      if (absolute && isAdUrl(absolute)) { element.remove(); return; }
+
+      const lower = checkVal.toLowerCase();
+      if (AD_KEYWORDS.some((kw) => lower.includes(kw))) { element.remove(); return; }
     }
   }
 }
@@ -464,7 +447,7 @@ class RemoveAdElementHandler {
 class AttrRewriteHandler {
   constructor(baseTargetUrl, incomingUrl) {
     this.baseTargetUrl = baseTargetUrl;
-    this.incomingUrl = incomingUrl;
+    this.incomingUrl   = incomingUrl;
   }
 
   element(element) {
@@ -472,31 +455,30 @@ class AttrRewriteHandler {
       const value = element.getAttribute(attr);
       if (!value) continue;
 
-      /*
-        ✅ FIX — pipe-separated dual URL format ကို handle
-        format: "https://full.jpg|/path/xs.jpg"
-        ပထမ URL ကိုသာ rewrite လုပ်ပြီး xs ကို path-only အဖြစ် ထားခဲ့
-      */
+      // ✅ FIX 5: pipe-separated "full.jpg|xs.jpg" format
+      //   → ပထမ URL ကိုသာ src ထဲ ထည့် (xs URL ဖယ်)
+      //   → browser က valid single URL တစ်ခုကိုသာ မြင်
       if (value.includes("|")) {
-        const parts = value.split("|");
-        const rewritten = parts.map((p) =>
-          rewriteOneUrl(p.trim(), this.baseTargetUrl, this.incomingUrl)
+        const firstUrl = value.split("|")[0].trim();
+        element.setAttribute(
+          attr,
+          rewriteOneUrl(firstUrl, this.baseTargetUrl, this.incomingUrl),
         );
-        element.setAttribute(attr, rewritten.join("|"));
         continue;
       }
 
       element.setAttribute(
         attr,
-        rewriteOneUrl(value, this.baseTargetUrl, this.incomingUrl)
+        rewriteOneUrl(value, this.baseTargetUrl, this.incomingUrl),
       );
     }
 
+    // srcset
     const srcset = element.getAttribute("srcset");
     if (srcset) {
       element.setAttribute(
         "srcset",
-        rewriteSrcset(srcset, this.baseTargetUrl, this.incomingUrl)
+        rewriteSrcset(srcset, this.baseTargetUrl, this.incomingUrl),
       );
     }
 
@@ -510,16 +492,14 @@ class AttrRewriteHandler {
 class StyleAttrRewriteHandler {
   constructor(baseTargetUrl, incomingUrl) {
     this.baseTargetUrl = baseTargetUrl;
-    this.incomingUrl = incomingUrl;
+    this.incomingUrl   = incomingUrl;
   }
-
   element(element) {
     const style = element.getAttribute("style");
     if (!style) return;
-
     element.setAttribute(
       "style",
-      rewriteCssUrls(style, this.baseTargetUrl, this.incomingUrl)
+      rewriteCssUrls(style, this.baseTargetUrl, this.incomingUrl),
     );
   }
 }
@@ -527,18 +507,13 @@ class StyleAttrRewriteHandler {
 class NoscriptRewriteHandler {
   constructor(baseTargetUrl, incomingUrl) {
     this.baseTargetUrl = baseTargetUrl;
-    this.incomingUrl = incomingUrl;
-    this.buffer = "";
+    this.incomingUrl   = incomingUrl;
+    this.buffer        = "";
   }
-
   text(chunk) {
     this.buffer += chunk.text;
     if (chunk.lastInTextNode) {
-      const rewritten = rewriteTextUrls(
-        this.buffer,
-        this.baseTargetUrl,
-        this.incomingUrl
-      );
+      const rewritten = rewriteTextUrls(this.buffer, this.baseTargetUrl, this.incomingUrl);
       chunk.replace(rewritten, { html: true });
       this.buffer = "";
     } else {
@@ -547,23 +522,19 @@ class NoscriptRewriteHandler {
   }
 }
 
-/* =========================
-   Rewriters
-========================= */
-
+// ============================================================
+//  Rewriters
+// ============================================================
 function rewriteSrcset(srcset, baseTargetUrl, incomingUrl) {
   return srcset
     .split(",")
     .map((part) => {
       const trimmed = part.trim();
       if (!trimmed) return trimmed;
-
       const match = trimmed.match(/^(\S+)(\s+.*)?$/);
       if (!match) return trimmed;
-
-      const urlPart = match[1];
+      const urlPart    = match[1];
       const descriptor = match[2] || "";
-
       return `${rewriteOneUrl(urlPart, baseTargetUrl, incomingUrl)}${descriptor}`;
     })
     .join(", ");
@@ -571,121 +542,140 @@ function rewriteSrcset(srcset, baseTargetUrl, incomingUrl) {
 
 function rewriteCssUrls(css, baseTargetUrl, incomingUrl) {
   return css
-    .replace(
-      /url\(\s*(['"]?)(.*?)\1\s*\)/gi,
-      (full, quote, rawUrl) => {
-        const value = rawUrl.trim();
-        if (!value) return full;
-
-        const rewritten = rewriteOneUrl(value, baseTargetUrl, incomingUrl);
-        return `url("${rewritten}")`;
-      }
-    )
-    .replace(
-      /@import\s+(['"])(.*?)\1/gi,
-      (full, quote, rawUrl) => {
-        const rewritten = rewriteOneUrl(rawUrl, baseTargetUrl, incomingUrl);
-        return `@import "${rewritten}"`;
-      }
-    );
+    .replace(/url\(\s*(['"]?)(.*?)\1\s*\)/gi, (full, quote, rawUrl) => {
+      const value = rawUrl.trim();
+      if (!value) return full;
+      return `url("${rewriteOneUrl(value, baseTargetUrl, incomingUrl)}")`;
+    })
+    .replace(/@import\s+(['"])(.*?)\1/gi, (full, quote, rawUrl) => {
+      return `@import "${rewriteOneUrl(rawUrl, baseTargetUrl, incomingUrl)}"`;
+    });
 }
 
 function rewriteTextUrls(text, baseTargetUrl, incomingUrl) {
-  /*
-    ✅ FIX — pipe | char ကို URL boundary အဖြစ် သတ်မှတ်
-    "https://full.jpg|/xs.jpg" → နှစ်ပိုင်းသီးသန့် rewrite ဖြစ်စေ
-  */
   return text.replace(
     /((?:https?:)?\/\/[^\s"'<>\\)|]+)/gi,
     (match) => {
-      let raw = match;
-
+      let raw  = match;
       let tail = "";
       while (/[.,;!?]$/.test(raw)) {
         tail = raw.slice(-1) + tail;
-        raw = raw.slice(0, -1);
+        raw  = raw.slice(0, -1);
       }
-
       try {
         const absolute = raw.startsWith("//")
           ? new URL(`https:${raw}`)
           : new URL(raw);
 
-        if (!isAllowedUrl(absolute)) {
-          return `about:blank${tail}`;
-        }
+        // ✅ FIX: signed URL → そのまま
+        if (isSignedUrl(absolute)) return match;
 
+        if (!isAllowedUrl(absolute)) return `about:blank${tail}`;
         return `${proxifyUrl(absolute, incomingUrl)}${tail}`;
       } catch {
         return match;
       }
-    }
+    },
   );
 }
 
-function rewriteM3U8(playlist, baseTargetUrl, incomingUrl) {
-  const lines = playlist.split(/\r?\n/);
-
-  const rewritten = lines.map((line) => {
-    const trimmed = line.trim();
-
-    if (!trimmed) return line;
-
-    if (trimmed.startsWith("#EXT-X-KEY") && trimmed.includes("URI=")) {
-      return line.replace(/URI=(["'])(.*?)\1/i, (full, quote, uri) => {
-        const rewrittenUri = rewriteOneUrl(uri, baseTargetUrl, incomingUrl);
-        return `URI=${quote}${rewrittenUri}${quote}`;
-      });
-    }
-
-    if (trimmed.startsWith("#EXT-X-MEDIA") && trimmed.includes("URI=")) {
-      return line.replace(/URI=(["'])(.*?)\1/i, (full, quote, uri) => {
-        const rewrittenUri = rewriteOneUrl(uri, baseTargetUrl, incomingUrl);
-        return `URI=${quote}${rewrittenUri}${quote}`;
-      });
-    }
-
-    if (!trimmed.startsWith("#")) {
-      return rewriteOneUrl(trimmed, baseTargetUrl, incomingUrl);
-    }
-
-    return line;
-  });
-
-  return rewritten.join("\n");
+// ✅ FIX 4: JSON-safe rewrite
+//   signed URL ပါသော JSON field ကို rewrite မလုပ်
+function rewriteJsonTextSafe(text, baseTargetUrl, incomingUrl) {
+  try {
+    const json    = JSON.parse(text);
+    const patched = walkJsonUrls(json, baseTargetUrl, incomingUrl);
+    return JSON.stringify(patched);
+  } catch {
+    // parse မရသော JSON → plain text rewrite
+    return rewriteTextUrls(text, baseTargetUrl, incomingUrl);
+  }
 }
 
-/* =========================
-   Ad cleanup
-========================= */
+function walkJsonUrls(obj, baseTargetUrl, incomingUrl) {
+  if (typeof obj === "string") {
+    // pipe format
+    if (obj.includes("|") && (obj.startsWith("http") || obj.startsWith("/"))) {
+      const parts = obj.split("|");
+      return parts.map((p) => safeRewriteJsonUrl(p.trim(), baseTargetUrl, incomingUrl)).join("|");
+    }
+    return safeRewriteJsonUrl(obj, baseTargetUrl, incomingUrl);
+  }
+  if (Array.isArray(obj)) return obj.map((v) => walkJsonUrls(v, baseTargetUrl, incomingUrl));
+  if (obj && typeof obj === "object") {
+    const out = {};
+    for (const k of Object.keys(obj)) out[k] = walkJsonUrls(obj[k], baseTargetUrl, incomingUrl);
+    return out;
+  }
+  return obj;
+}
 
+function safeRewriteJsonUrl(str, baseTargetUrl, incomingUrl) {
+  if (!str || typeof str !== "string") return str;
+  const trimmed = str.trim();
+  if (!trimmed.startsWith("http") && !trimmed.startsWith("//")) return str;
+
+  try {
+    const abs = new URL(trimmed);
+    // ✅ signed URL → direct (rewrite しない)
+    if (isSignedUrl(abs)) return abs.toString();
+    if (!isAllowedUrl(abs)) return "about:blank";
+    return proxifyUrl(abs, incomingUrl);
+  } catch {
+    return str;
+  }
+}
+
+function rewriteM3U8(playlist, baseTargetUrl, incomingUrl) {
+  return playlist
+    .split(/\r?\n/)
+    .map((line) => {
+      const trimmed = line.trim();
+      if (!trimmed) return line;
+
+      if (trimmed.startsWith("#EXT-X-KEY") && trimmed.includes("URI=")) {
+        return line.replace(/URI=(["'])(.*?)\1/i, (full, q, uri) => {
+          return `URI=${q}${rewriteOneUrl(uri, baseTargetUrl, incomingUrl)}${q}`;
+        });
+      }
+      if (trimmed.startsWith("#EXT-X-MEDIA") && trimmed.includes("URI=")) {
+        return line.replace(/URI=(["'])(.*?)\1/i, (full, q, uri) => {
+          return `URI=${q}${rewriteOneUrl(uri, baseTargetUrl, incomingUrl)}${q}`;
+        });
+      }
+      if (!trimmed.startsWith("#")) {
+        // ✅ FIX: segment URL signed ဆိုရင် direct
+        try {
+          const abs = new URL(trimmed, baseTargetUrl);
+          if (isSignedUrl(abs)) return abs.toString();
+        } catch {}
+        return rewriteOneUrl(trimmed, baseTargetUrl, incomingUrl);
+      }
+      return line;
+    })
+    .join("\n");
+}
+
+// ============================================================
+//  Ad cleanup
+// ============================================================
 function removeAdBlocksFromHtml(html) {
+  // <script> — player scripts ကို ဆက်ထား
   html = html.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, (block) => {
     const lower = block.toLowerCase();
-
     if (
       lower.includes("jwplayer") ||
       lower.includes("videojs") ||
       lower.includes("hls.js") ||
       lower.includes("plyr")
-    ) {
-      return block;
-    }
-
-    return AD_KEYWORDS.some((keyword) =>
-      lower.includes(keyword.toLowerCase())
-    )
-      ? ""
-      : block;
+    ) return block;
+    return AD_KEYWORDS.some((kw) => lower.includes(kw.toLowerCase())) ? "" : block;
   });
 
+  // <iframe>
   html = html.replace(/<iframe\b[^>]*>[\s\S]*?<\/iframe>/gi, (block) => {
     const lower = block.toLowerCase();
-    return AD_KEYWORDS.some((keyword) =>
-      lower.includes(keyword.toLowerCase())
-    )
-      ? ""
-      : block;
+    return AD_KEYWORDS.some((kw) => lower.includes(kw.toLowerCase())) ? "" : block;
   });
 
   return html;
@@ -693,15 +683,13 @@ function removeAdBlocksFromHtml(html) {
 
 function removeAdCodeFromText(text) {
   const lower = text.toLowerCase();
-
-  if (AD_KEYWORDS.some((keyword) => lower.includes(keyword.toLowerCase()))) {
+  if (AD_KEYWORDS.some((kw) => lower.includes(kw.toLowerCase()))) {
     text = text.replace(/window\.open\s*\([^)]*\)\s*;?/gi, "");
     text = text.replace(
       /document\.write\s*\([^)]*(ads|pop|iframe)[^)]*\)\s*;?/gi,
-      ""
+      "",
     );
   }
-
   return text;
 }
 
@@ -723,138 +711,142 @@ iframe[src*="pop" i] {
 }
 </style>
 `;
-
-  if (html.includes("</head>")) {
-    return html.replace("</head>", `${css}</head>`);
-  }
-
-  return css + html;
+  return html.includes("</head>")
+    ? html.replace("</head>", `${css}</head>`)
+    : css + html;
 }
 
-/*
-  ✅ FIX — R2 Signed URL + Plyr runtime intercept
-  Site က JavaScript ထဲမှာ fetch() ခေါ်ပြီး video URL ရတာဖြစ်လို့
-  native fetch ကို override လုပ်ကာ response ထဲက URL တွေကို
-  proxy URL အဖြစ် ပြောင်းပေးသည်
-*/
+// ============================================================
+//  Video player patch (injected into <head>)
+// ============================================================
 function injectVideoPlayerPatch(html, incomingUrl) {
   const proxyBase = `${incomingUrl.protocol}//${incomingUrl.host}${PROXY_PATH}`;
 
   const patch = `
 <script>
 (function () {
-  const PROXY_BASE = ${JSON.stringify(proxyBase)};
-  const TARGET_HOST = ${JSON.stringify(TARGET_HOST)};
+  "use strict";
 
-  /* ── URL → Proxy URL helper ── */
-  function toProxyUrl(url) {
-    if (!url || typeof url !== "string") return url;
-    const trimmed = url.trim();
-    if (
-      trimmed.startsWith("blob:") ||
-      trimmed.startsWith("data:") ||
-      trimmed.startsWith("#") ||
-      trimmed.startsWith("javascript:")
-    ) return url;
+  var PROXY_BASE   = ${JSON.stringify(proxyBase)};
+  var TARGET_HOST  = ${JSON.stringify(TARGET_HOST)};
 
-    // same-origin path → pass through
-    if (trimmed.startsWith("/") && !trimmed.startsWith("//")) return url;
-
+  /* ── signed URL detection (client side) ── */
+  function isSignedUrl(url) {
     try {
-      const u = new URL(trimmed, location.href);
-      // same hostname → pass through
-      if (u.hostname === location.hostname) return url;
-      // already proxied
-      if (u.pathname === "/__proxy") return url;
-      return PROXY_BASE + "?url=" + encodeURIComponent(u.toString());
-    } catch (e) {
-      return url;
-    }
+      var u = new URL(url);
+      return (
+        u.searchParams.has("X-Amz-Signature") ||
+        u.searchParams.has("x-amz-signature") ||
+        (u.searchParams.has("X-Amz-Expires") && u.searchParams.has("X-Amz-Credential"))
+      );
+    } catch (e) { return false; }
   }
 
-  /* ── JSON deep-walk: URL တန်ဖိုးတွေ rewrite ── */
+  /* ── URL → Proxy URL ── */
+  function toProxyUrl(url) {
+    if (!url || typeof url !== "string") return url;
+    var t = url.trim();
+    if (
+      t.startsWith("blob:") || t.startsWith("data:") ||
+      t.startsWith("#")     || t.startsWith("javascript:")
+    ) return url;
+
+    // same-origin path
+    if (t.startsWith("/") && !t.startsWith("//")) return url;
+
+    try {
+      var u = new URL(t, location.href);
+      if (u.hostname === location.hostname) return url;
+      if (u.pathname === "/__proxy")         return url;
+
+      // ✅ signed URL → direct (proxy 経由しない)
+      if (isSignedUrl(u)) return u.toString();
+
+      return PROXY_BASE + "?url=" + encodeURIComponent(u.toString());
+    } catch (e) { return url; }
+  }
+
+  /* ── JSON deep-walk ── */
   function proxyJsonUrls(obj) {
     if (typeof obj === "string") {
-      // pipe-separated dual URL format "full.jpg|xs.jpg"
-      if (obj.includes("|")) {
+      if (obj.includes("|") && (obj.startsWith("http") || obj.startsWith("/"))) {
         return obj.split("|").map(toProxyUrl).join("|");
       }
       return toProxyUrl(obj);
     }
     if (Array.isArray(obj)) return obj.map(proxyJsonUrls);
     if (obj && typeof obj === "object") {
-      const out = {};
-      for (const k of Object.keys(obj)) out[k] = proxyJsonUrls(obj[k]);
+      var out = {};
+      for (var k in obj) if (Object.prototype.hasOwnProperty.call(obj, k)) {
+        out[k] = proxyJsonUrls(obj[k]);
+      }
       return out;
     }
     return obj;
   }
 
-  /* ── fetch() override: JSON response ထဲက URL rewrite ── */
-  const _fetch = window.fetch.bind(window);
+  /* ── fetch() override ── */
+  var _fetch = window.fetch.bind(window);
   window.fetch = async function (input, init) {
-    // request URL ကို proxy ကနေ ဖြတ်
-    let reqUrl = typeof input === "string" ? input
+    var reqUrl = typeof input === "string" ? input
       : (input instanceof Request ? input.url : String(input));
-    reqUrl = toProxyUrl(reqUrl);
 
-    const res = await _fetch(
-      typeof input === "string"
-        ? reqUrl
-        : new Request(reqUrl, input),
+    // signed URL → proxy に通さない
+    if (!isSignedUrl(reqUrl)) {
+      reqUrl = toProxyUrl(reqUrl);
+    }
+
+    var res = await _fetch(
+      typeof input === "string" ? reqUrl : new Request(reqUrl, input),
       init
     );
 
-    const ct = res.headers.get("content-type") || "";
+    var ct = res.headers.get("content-type") || "";
 
-    /* JSON response ဆိုရင် deep-rewrite */
+    /* JSON response → deep-rewrite (signed URL 除く) */
     if (ct.includes("application/json") || ct.includes("text/json")) {
-      const clone = res.clone();
+      var clone = res.clone();
       try {
-        const json = await clone.json();
-        const patched = proxyJsonUrls(json);
+        var json    = await clone.json();
+        var patched = proxyJsonUrls(json);
         return new Response(JSON.stringify(patched), {
-          status: res.status,
+          status:     res.status,
           statusText: res.statusText,
-          headers: res.headers
+          headers:    res.headers,
         });
-      } catch (e) {
-        return res;
-      }
+      } catch (e) { return res; }
     }
-
     return res;
   };
 
   /* ── XMLHttpRequest override ── */
-  const _XHROpen = XMLHttpRequest.prototype.open;
-  XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+  var _XHROpen = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function (method, url) {
+    var rest = Array.prototype.slice.call(arguments, 2);
     try {
-      this._proxyUrl = toProxyUrl(String(url));
-    } catch (e) {
-      this._proxyUrl = url;
-    }
-    return _XHROpen.call(this, method, this._proxyUrl, ...rest);
+      var proxied = isSignedUrl(String(url)) ? String(url) : toProxyUrl(String(url));
+      this._proxyUrl = proxied;
+    } catch (e) { this._proxyUrl = url; }
+    return _XHROpen.apply(this, [method, this._proxyUrl].concat(rest));
   };
 
-  /* ── Plyr source set patch ── */
+  /* ── DOM ready patches ── */
   document.addEventListener("DOMContentLoaded", function () {
 
-    /* MutationObserver — video/source element inject ─ */
+    /* MutationObserver — 動的 video/source 要素 */
     new MutationObserver(function (mutations) {
       mutations.forEach(function (m) {
         m.addedNodes.forEach(function (node) {
           if (!node || !node.getAttribute) return;
           ["src", "data-src", "poster"].forEach(function (attr) {
-            const val = node.getAttribute(attr);
-            if (val) node.setAttribute(attr, toProxyUrl(val));
+            var val = node.getAttribute(attr);
+            if (val && !isSignedUrl(val)) node.setAttribute(attr, toProxyUrl(val));
           });
-          /* child <source> တွေပါ စစ် */
           if (node.querySelectorAll) {
             node.querySelectorAll("[src],[data-src]").forEach(function (el) {
               ["src", "data-src"].forEach(function (attr) {
-                const v = el.getAttribute(attr);
-                if (v) el.setAttribute(attr, toProxyUrl(v));
+                var v = el.getAttribute(attr);
+                if (v && !isSignedUrl(v)) el.setAttribute(attr, toProxyUrl(v));
               });
             });
           }
@@ -862,27 +854,26 @@ function injectVideoPlayerPatch(html, incomingUrl) {
       });
     }).observe(document.body, { childList: true, subtree: true });
 
-    /* ── Plyr instance property override ── */
+    /* ── Plyr instance patch ── */
     function patchPlyrInstance(player) {
       if (!player || player.__proxied) return;
       player.__proxied = true;
       try {
-        const origSource = Object.getOwnPropertyDescriptor(
-          Object.getPrototypeOf(player), "source"
-        );
-        if (origSource && origSource.set) {
-          const origSet = origSource.set.bind(player);
+        var proto   = Object.getPrototypeOf(player);
+        var origDesc = Object.getOwnPropertyDescriptor(proto, "source");
+        if (origDesc && origDesc.set) {
+          var origSet = origDesc.set.bind(player);
           Object.defineProperty(player, "source", {
-            get: origSource.get ? origSource.get.bind(player) : undefined,
+            get: origDesc.get ? origDesc.get.bind(player) : undefined,
             set: function (src) {
-              if (src && src.sources) {
+              if (src && Array.isArray(src.sources)) {
                 src.sources = src.sources.map(function (s) {
-                  if (s && s.src) s.src = toProxyUrl(s.src);
+                  if (s && s.src && !isSignedUrl(s.src)) s.src = toProxyUrl(s.src);
                   return s;
                 });
               }
               origSet(src);
-            }
+            },
           });
         }
       } catch (e) {}
@@ -890,23 +881,30 @@ function injectVideoPlayerPatch(html, incomingUrl) {
 
     /* window.Plyr constructor override */
     if (window.Plyr) {
-      const OrigPlyr = window.Plyr;
-      window.Plyr = function (target, opts) {
-        const instance = new OrigPlyr(target, opts);
+      var OrigPlyr = window.Plyr;
+      window.Plyr  = function (target, opts) {
+        var instance = new OrigPlyr(target, opts);
         patchPlyrInstance(instance);
         return instance;
       };
       Object.assign(window.Plyr, OrigPlyr);
     }
+
+    /* ── img pipe-src fix: src に | が残っていたら最初の部分だけ使う ── */
+    document.querySelectorAll("img[src]").forEach(function (img) {
+      var src = img.getAttribute("src");
+      if (src && src.includes("|")) {
+        img.setAttribute("src", src.split("|")[0].trim());
+      }
+    });
+
   });
 
 })();
 </script>
 `;
 
-  if (html.includes("<head>")) {
-    return html.replace("<head>", `<head>${patch}`);
-  }
-
-  return patch + html;
+  return html.includes("<head>")
+    ? html.replace("<head>", "<head>" + patch)
+    : patch + html;
 }
