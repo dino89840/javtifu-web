@@ -1,23 +1,34 @@
 // ============================================================
 //  Cloudflare Pages Function — _worker.js  (functions/_worker.js)
-//  javtiful.com proxy  ·  Fixed: images + R2 signed video URLs
+//  javtiful.com proxy  ·  FIXED: video playback via stream-relay
+//
+//  အဓိက ပြင်ဆင်ချက်:
+//   ✅ signed URL / media file → direct redirect မလုပ်တော့ဘဲ
+//      Worker ကိုယ်တိုင်က Range-aware stream relay လုပ်ပေး
+//      (R2/S3 signed URL က browser direct request မှာ 403/CORS fail ဖြစ်လို့)
+//   ✅ upstream fetch မှာ referer/origin header မှန်ကန်စွာ ထည့်ပေး
+//   ✅ Range header forward + Accept-Ranges → seek အဆင်ပြေ
 // ============================================================
 
 const TARGET_HOST   = "javtiful.com";
 const TARGET_ORIGIN = `https://${TARGET_HOST}`;
 const PROXY_PATH    = "/__proxy";
+const MEDIA_PATH    = "/__media";   // ✅ NEW: media stream-relay endpoint
 
 const ALLOW_ANY_EXTERNAL_HOST = true;
 
-// ✅ FIX 1: CDN/player hosts whitelist — ad filter မှ ကျော်သွားစေ
+const UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+  "(KHTML, like Gecko) Chrome/126 Safari/537.36";
+
 const CDN_WHITELIST_HOSTS = new Set([
   "sspark.genspark.ai",
   "cdn.plyr.io",
   "vjs.zencdn.net",
   "cdnjs.cloudflare.com",
   "cdn.jsdelivr.net",
-  "www.googletagmanager.com",   // gtag script — block မလုပ်
-  "www.google-analytics.com",   // analytics — block မလုပ်
+  "www.googletagmanager.com",
+  "www.google-analytics.com",
 ]);
 
 const ALLOWED_HOST_SUFFIXES = [
@@ -26,28 +37,10 @@ const ALLOWED_HOST_SUFFIXES = [
 ];
 
 const AD_KEYWORDS = [
-  "adserver",
-  "adsterra",
-  "juicyads",
-  "exoclick",
-  "popads",
-  "popcash",
-  "popunder",
-  "doubleclick",
-  "googlesyndication",
-  // ✅ FIX: google-analytics / googletagmanager ဖယ်ထုတ်
-  //   → site ၏ plyr/player script တွေ break မဖြစ်အောင်
-  "histats",
-  "trafficjunky",
-  "trafficfactory",
-  "propellerads",
-  "hilltopads",
-  "a.exdynsrv.com",
-  "exdynsrv",
-  "revcontent",
-  "mgid",
-  "taboola",
-  "outbrain",
+  "adserver", "adsterra", "juicyads", "exoclick", "popads", "popcash",
+  "popunder", "doubleclick", "googlesyndication", "histats",
+  "trafficjunky", "trafficfactory", "propellerads", "hilltopads",
+  "a.exdynsrv.com", "exdynsrv", "revcontent", "mgid", "taboola", "outbrain",
 ];
 
 const REWRITE_ATTRS = [
@@ -57,18 +50,48 @@ const REWRITE_ATTRS = [
   "data-image", "data-thumb",
 ];
 
-// ✅ FIX 2: R2/S3 presigned URL detection
-//   X-Amz-Signature ပါသော URL → proxy မဖြတ်ဘဲ direct access ပေး
+// ============================================================
+//  signed URL / media detection
+// ============================================================
 function isSignedUrl(url) {
   const u = url instanceof URL ? url : null;
   if (!u) return false;
   return (
     u.searchParams.has("X-Amz-Signature") ||
     u.searchParams.has("x-amz-signature") ||
-    u.searchParams.has("Signature") ||           // older S3
+    u.searchParams.has("Signature") ||
     (u.searchParams.has("X-Amz-Expires") &&
      u.searchParams.has("X-Amz-Credential"))
   );
+}
+
+// ✅ media file ဟုတ်/မဟုတ် (video / hls / ts / R2 / Stream host)
+function isMediaUrl(url) {
+  const u = url instanceof URL ? url : null;
+  if (!u) return false;
+
+  const host = (u.hostname || "").toLowerCase();
+  const path = (u.pathname || "").toLowerCase();
+
+  if (
+    /r2\.cloudflarestorage\.com$/i.test(host) ||
+    /\.r2\.dev$/i.test(host) ||
+    /cloudflarestream\.com$/i.test(host) ||
+    /qyshare\.com$/i.test(host)
+  ) {
+    return true;
+  }
+
+  if (/\.(?:mp4|m3u8|ts|webm|mkv|mov|m4s|mp3|m4a|aac)(?:$|\?)/i.test(path)) {
+    return true;
+  }
+
+  return false;
+}
+
+// ✅ signed URL / cross-origin media → Worker proxy-stream သုံးသင့်/မသင့်
+function shouldStreamRelay(url) {
+  return isSignedUrl(url) || isMediaUrl(url);
 }
 
 // ============================================================
@@ -80,6 +103,11 @@ export async function onRequest(context) {
 
   if (request.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: corsHeaders() });
+  }
+
+  // ✅ NEW: media stream-relay endpoint
+  if (incomingUrl.pathname === MEDIA_PATH) {
+    return handleMediaRelay(request, incomingUrl);
   }
 
   let targetUrl;
@@ -97,10 +125,10 @@ export async function onRequest(context) {
     return emptyBlockedResponse();
   }
 
-  // ✅ FIX 3: R2 signed URL → direct 302 redirect
-  //   Proxy worker ကနေ ဖြတ်မသွားဘဲ browser ကို တိုက်ရိုက် R2 URL ပို့
-  if (isSignedUrl(targetUrl)) {
-    return Response.redirect(targetUrl.toString(), 302);
+  // ✅ FIX (အဓိက): signed URL / media → redirect အစား stream-relay
+  //   browser direct request မှာ R2/S3 signed URL က 403/CORS fail ဖြစ်လို့
+  if (shouldStreamRelay(targetUrl)) {
+    return relayMedia(request, targetUrl);
   }
 
   const upstreamHeaders = buildRequestHeaders(request, targetUrl);
@@ -123,7 +151,7 @@ export async function onRequest(context) {
     });
   }
 
-  // ── Redirect ─────────────────────────────────────────────────────────────
+  // ── Redirect ─────────────────────────────────────────────
   if (isRedirect(upstreamResponse.status)) {
     const location = upstreamResponse.headers.get("location");
     const headers  = buildResponseHeaders(upstreamResponse.headers, incomingUrl.host, false);
@@ -131,9 +159,9 @@ export async function onRequest(context) {
     if (location) {
       const abs = safeResolveUrl(location, targetUrl);
       if (abs) {
-        // ✅ FIX: Redirect が signed URL なら direct
-        if (isSignedUrl(abs)) {
-          headers.set("location", abs.toString());
+        // ✅ FIX: redirect target က signed/media → media-relay endpoint
+        if (shouldStreamRelay(abs)) {
+          headers.set("location", mediaProxyUrl(abs, incomingUrl));
         } else if (isAllowedUrl(abs)) {
           headers.set("location", proxifyUrl(abs, incomingUrl));
         }
@@ -145,7 +173,7 @@ export async function onRequest(context) {
   const contentType = upstreamResponse.headers.get("content-type") || "";
   const pathname    = targetUrl.pathname.toLowerCase();
 
-  // ── HTML ─────────────────────────────────────────────────────────────────
+  // ── HTML ─────────────────────────────────────────────────
   if (contentType.includes("text/html")) {
     let html = await upstreamResponse.text();
     html = removeAdBlocksFromHtml(html);
@@ -169,7 +197,7 @@ export async function onRequest(context) {
       .transform(resp);
   }
 
-  // ── HLS m3u8 ─────────────────────────────────────────────────────────────
+  // ── HLS m3u8 ─────────────────────────────────────────────
   if (
     contentType.includes("application/vnd.apple.mpegurl") ||
     contentType.includes("application/x-mpegurl") ||
@@ -180,10 +208,11 @@ export async function onRequest(context) {
 
     const headers = buildResponseHeaders(upstreamResponse.headers, incomingUrl.host, true);
     headers.set("content-type", "application/vnd.apple.mpegurl; charset=UTF-8");
+    headers.set("accept-ranges", "bytes");
     return new Response(playlist, { status: upstreamResponse.status, headers });
   }
 
-  // ── CSS ──────────────────────────────────────────────────────────────────
+  // ── CSS ──────────────────────────────────────────────────
   if (contentType.includes("text/css") || pathname.endsWith(".css")) {
     let css = await upstreamResponse.text();
     css = rewriteCssUrls(css, targetUrl, incomingUrl);
@@ -194,7 +223,7 @@ export async function onRequest(context) {
     return new Response(css, { status: upstreamResponse.status, headers });
   }
 
-  // ── JS / JSON / text ─────────────────────────────────────────────────────
+  // ── JS / JSON / text ─────────────────────────────────────
   if (
     contentType.includes("javascript") ||
     contentType.includes("application/json") ||
@@ -210,8 +239,6 @@ export async function onRequest(context) {
       text = removeAdCodeFromText(text);
     }
 
-    // ✅ FIX 4: JSON response ထဲ R2 signed URL ပါနိုင်သောကြောင့်
-    //   rewriteTextUrls မလုပ်ဘဲ JSON-aware rewrite သုံး
     if (
       contentType.includes("application/json") ||
       pathname.endsWith(".json")
@@ -225,13 +252,105 @@ export async function onRequest(context) {
     return new Response(text, { status: upstreamResponse.status, headers });
   }
 
-  // ── Binary ───────────────────────────────────────────────────────────────
+  // ── Binary ───────────────────────────────────────────────
   const headers = buildResponseHeaders(upstreamResponse.headers, incomingUrl.host, false);
   return new Response(upstreamResponse.body, {
     status:     upstreamResponse.status,
     statusText: upstreamResponse.statusText,
     headers,
   });
+}
+
+// ============================================================
+//  ✅ NEW: Media stream-relay (video ကြည့်လို့ရအောင် အဓိက logic)
+//  /__media?url=<encoded media url>
+//  Range forward + referer header + chunk pass-through
+// ============================================================
+async function handleMediaRelay(request, incomingUrl) {
+  const raw = incomingUrl.searchParams.get("url");
+  if (!raw) return new Response("Missing media url", { status: 400 });
+
+  let mediaUrl;
+  try {
+    mediaUrl = new URL(decodeURIComponent(raw));
+  } catch {
+    return new Response("Bad media url", { status: 400 });
+  }
+  if (mediaUrl.protocol !== "http:" && mediaUrl.protocol !== "https:") {
+    return new Response("Invalid protocol", { status: 400 });
+  }
+  if (isAdUrl(mediaUrl)) return emptyBlockedResponse();
+
+  return relayMedia(request, mediaUrl);
+}
+
+// upstream media ကို Range-aware stream relay လုပ်တဲ့ core function
+async function relayMedia(request, mediaUrl) {
+  const fwd = new Headers();
+  fwd.set("User-Agent", UA);
+  fwd.set("Accept", "*/*");
+
+  // ✅ referer/origin — signed URL/media host က referer-bound ဖြစ်နိုင်လို့
+  //   signed URL မှာ host က R2 ဆို target site ကို referer ပေး
+  fwd.set("Referer", `${TARGET_ORIGIN}/`);
+  fwd.set("Origin", TARGET_ORIGIN);
+
+  // ✅ seek — client Range ကို တိုက်ရိုက် forward
+  const range = request.headers.get("Range");
+  if (range) fwd.set("Range", range);
+
+  let upstream;
+  try {
+    upstream = await fetch(mediaUrl.toString(), {
+      method:   request.method === "HEAD" ? "HEAD" : "GET",
+      headers:  fwd,
+      redirect: "follow",
+    });
+  } catch (err) {
+    return new Response(`Media fetch error: ${err.message}`, {
+      status: 502,
+      headers: corsHeaders(),
+    });
+  }
+
+  const respHeaders = new Headers();
+
+  // upstream ၏ range/size/cache header တွေ pass
+  for (const h of [
+    "content-range", "content-length", "content-type",
+    "last-modified", "etag", "accept-ranges",
+  ]) {
+    const v = upstream.headers.get(h);
+    if (v) respHeaders.set(h, v);
+  }
+
+  if (!respHeaders.has("accept-ranges")) {
+    respHeaders.set("accept-ranges", "bytes");
+  }
+
+  // CORS — browser direct fail ဖြစ်တာ ဒီကနေ ဖြေရှင်း
+  for (const [k, v] of corsHeaders().entries()) respHeaders.set(k, v);
+  respHeaders.set("x-proxy-by", "cloudflare-pages-function-media");
+
+  // HEAD → body မပါ
+  if (request.method === "HEAD") {
+    return new Response(null, {
+      status:  upstream.status,
+      headers: respHeaders,
+    });
+  }
+
+  // ✅ chunk-by-chunk pass-through — buffer မစုပ်၊ TTFB မြန်
+  return new Response(upstream.body, {
+    status:  upstream.status,   // 200 (full) / 206 (partial)
+    headers: respHeaders,
+  });
+}
+
+// media-relay endpoint URL ဆောက်
+function mediaProxyUrl(targetUrl, incomingUrl) {
+  const u = targetUrl instanceof URL ? targetUrl : new URL(targetUrl);
+  return `${MEDIA_PATH}?url=${encodeURIComponent(u.toString())}`;
 }
 
 // ============================================================
@@ -274,8 +393,8 @@ function proxifyUrl(targetUrl, incomingUrl) {
 
   if (isAdUrl(u)) return "about:blank";
 
-  // ✅ FIX: signed URL → direct (proxy မဖြတ်)
-  if (isSignedUrl(u)) return u.toString();
+  // ✅ FIX: signed/media → redirect/direct မလုပ်ဘဲ media-relay endpoint
+  if (shouldStreamRelay(u)) return mediaProxyUrl(u, incomingUrl);
 
   if (isTargetHost(u.hostname)) {
     return `${u.pathname}${u.search}${u.hash}`;
@@ -287,8 +406,8 @@ function rewriteOneUrl(value, baseTargetUrl, incomingUrl) {
   const absolute = safeResolveUrl(value, baseTargetUrl);
   if (!absolute) return value;
 
-  // ✅ FIX: signed URL → そのまま返す
-  if (isSignedUrl(absolute)) return absolute.toString();
+  // ✅ FIX: signed/media → media-relay endpoint
+  if (shouldStreamRelay(absolute)) return mediaProxyUrl(absolute, incomingUrl);
 
   if (!isAllowedUrl(absolute)) return "about:blank";
   return proxifyUrl(absolute, incomingUrl);
@@ -302,8 +421,6 @@ function isAllowedUrl(url) {
   if (!url || (url.protocol !== "http:" && url.protocol !== "https:")) return false;
   if (isAdUrl(url)) return false;
   if (isTargetHost(url.hostname)) return true;
-
-  // CDN whitelist → always allow
   if (CDN_WHITELIST_HOSTS.has(url.hostname)) return true;
 
   for (const suffix of ALLOWED_HOST_SUFFIXES) {
@@ -314,14 +431,8 @@ function isAllowedUrl(url) {
 
 function isAdUrl(url) {
   if (!url) return false;
-
   const hostname = (url.hostname || "").toLowerCase();
-
-  // ✅ FIX: CDN whitelist → ad check bypass
   if (CDN_WHITELIST_HOSTS.has(hostname)) return false;
-
-  // hostname ကိုသာ AD_KEYWORDS စစ် (path/query မစစ်)
-  // → sspark.genspark.ai?u1=...ads... ကဲ့သို့ query ထဲ "ads" ပါသော CDN မ block ဖြစ်စေ
   return AD_KEYWORDS.some((kw) => hostname.includes(kw.toLowerCase()));
 }
 
@@ -360,10 +471,7 @@ function buildRequestHeaders(request, targetUrl) {
   headers.set("referer", `${targetUrl.origin}/`);
   headers.set("origin",  targetUrl.origin);
   if (!headers.get("user-agent")) {
-    headers.set(
-      "user-agent",
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36",
-    );
+    headers.set("user-agent", UA);
   }
   return headers;
 }
@@ -394,7 +502,7 @@ function buildResponseHeaders(upstreamHeaders, proxyHost, modifiedBody) {
 function corsHeaders() {
   return new Headers({
     "access-control-allow-origin":   "*",
-    "access-control-allow-methods":  "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+    "access-control-allow-methods":  "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD",
     "access-control-allow-headers":  "*",
     "access-control-expose-headers": "*",
   });
@@ -432,7 +540,6 @@ class RemoveAdElementHandler {
       const value = element.getAttribute(attr);
       if (!value) continue;
 
-      // pipe format → ပထမ part ကိုသာ စစ်
       const checkVal = value.includes("|") ? value.split("|")[0].trim() : value;
       const absolute = safeResolveUrl(checkVal, this.baseTargetUrl);
 
@@ -455,9 +562,6 @@ class AttrRewriteHandler {
       const value = element.getAttribute(attr);
       if (!value) continue;
 
-      // ✅ FIX 5: pipe-separated "full.jpg|xs.jpg" format
-      //   → ပထမ URL ကိုသာ src ထဲ ထည့် (xs URL ဖယ်)
-      //   → browser က valid single URL တစ်ခုကိုသာ မြင်
       if (value.includes("|")) {
         const firstUrl = value.split("|")[0].trim();
         element.setAttribute(
@@ -473,7 +577,6 @@ class AttrRewriteHandler {
       );
     }
 
-    // srcset
     const srcset = element.getAttribute("srcset");
     if (srcset) {
       element.setAttribute(
@@ -482,7 +585,6 @@ class AttrRewriteHandler {
       );
     }
 
-    // lazy → eager
     if (element.getAttribute("loading") === "lazy") {
       element.setAttribute("loading", "eager");
     }
@@ -567,8 +669,10 @@ function rewriteTextUrls(text, baseTargetUrl, incomingUrl) {
           ? new URL(`https:${raw}`)
           : new URL(raw);
 
-        // ✅ FIX: signed URL → そのまま
-        if (isSignedUrl(absolute)) return match;
+        // ✅ FIX: signed/media → media-relay endpoint
+        if (shouldStreamRelay(absolute)) {
+          return `${mediaProxyUrl(absolute, incomingUrl)}${tail}`;
+        }
 
         if (!isAllowedUrl(absolute)) return `about:blank${tail}`;
         return `${proxifyUrl(absolute, incomingUrl)}${tail}`;
@@ -579,22 +683,18 @@ function rewriteTextUrls(text, baseTargetUrl, incomingUrl) {
   );
 }
 
-// ✅ FIX 4: JSON-safe rewrite
-//   signed URL ပါသော JSON field ကို rewrite မလုပ်
 function rewriteJsonTextSafe(text, baseTargetUrl, incomingUrl) {
   try {
     const json    = JSON.parse(text);
     const patched = walkJsonUrls(json, baseTargetUrl, incomingUrl);
     return JSON.stringify(patched);
   } catch {
-    // parse မရသော JSON → plain text rewrite
     return rewriteTextUrls(text, baseTargetUrl, incomingUrl);
   }
 }
 
 function walkJsonUrls(obj, baseTargetUrl, incomingUrl) {
   if (typeof obj === "string") {
-    // pipe format
     if (obj.includes("|") && (obj.startsWith("http") || obj.startsWith("/"))) {
       const parts = obj.split("|");
       return parts.map((p) => safeRewriteJsonUrl(p.trim(), baseTargetUrl, incomingUrl)).join("|");
@@ -616,9 +716,9 @@ function safeRewriteJsonUrl(str, baseTargetUrl, incomingUrl) {
   if (!trimmed.startsWith("http") && !trimmed.startsWith("//")) return str;
 
   try {
-    const abs = new URL(trimmed);
-    // ✅ signed URL → direct (rewrite しない)
-    if (isSignedUrl(abs)) return abs.toString();
+    const abs = trimmed.startsWith("//") ? new URL(`https:${trimmed}`) : new URL(trimmed);
+    // ✅ FIX: signed/media → media-relay endpoint
+    if (shouldStreamRelay(abs)) return mediaProxyUrl(abs, incomingUrl);
     if (!isAllowedUrl(abs)) return "about:blank";
     return proxifyUrl(abs, incomingUrl);
   } catch {
@@ -644,11 +744,8 @@ function rewriteM3U8(playlist, baseTargetUrl, incomingUrl) {
         });
       }
       if (!trimmed.startsWith("#")) {
-        // ✅ FIX: segment URL signed ဆိုရင် direct
-        try {
-          const abs = new URL(trimmed, baseTargetUrl);
-          if (isSignedUrl(abs)) return abs.toString();
-        } catch {}
+        // ✅ FIX: segment/playlist URL → media-relay endpoint
+        //   (signed ဖြစ်စေ မဖြစ်စေ Range forward လိုလို့ relay သုံး)
         return rewriteOneUrl(trimmed, baseTargetUrl, incomingUrl);
       }
       return line;
@@ -660,7 +757,6 @@ function rewriteM3U8(playlist, baseTargetUrl, incomingUrl) {
 //  Ad cleanup
 // ============================================================
 function removeAdBlocksFromHtml(html) {
-  // <script> — player scripts ကို ဆက်ထား
   html = html.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, (block) => {
     const lower = block.toLowerCase();
     if (
@@ -672,7 +768,6 @@ function removeAdBlocksFromHtml(html) {
     return AD_KEYWORDS.some((kw) => lower.includes(kw.toLowerCase())) ? "" : block;
   });
 
-  // <iframe>
   html = html.replace(/<iframe\b[^>]*>[\s\S]*?<\/iframe>/gi, (block) => {
     const lower = block.toLowerCase();
     return AD_KEYWORDS.some((kw) => lower.includes(kw.toLowerCase())) ? "" : block;
@@ -721,25 +816,56 @@ iframe[src*="pop" i] {
 // ============================================================
 function injectVideoPlayerPatch(html, incomingUrl) {
   const proxyBase = `${incomingUrl.protocol}//${incomingUrl.host}${PROXY_PATH}`;
+  const mediaBase = `${incomingUrl.protocol}//${incomingUrl.host}${MEDIA_PATH}`;
 
   const patch = `
 <script>
 (function () {
   "use strict";
 
-  var PROXY_BASE   = ${JSON.stringify(proxyBase)};
-  var TARGET_HOST  = ${JSON.stringify(TARGET_HOST)};
+  var PROXY_BASE  = ${JSON.stringify(proxyBase)};
+  var MEDIA_BASE  = ${JSON.stringify(mediaBase)};
+  var TARGET_HOST = ${JSON.stringify(TARGET_HOST)};
 
-  /* ── signed URL detection (client side) ── */
+  /* ── signed URL detection ── */
   function isSignedUrl(url) {
     try {
-      var u = new URL(url);
+      var u = new URL(url, location.href);
       return (
         u.searchParams.has("X-Amz-Signature") ||
         u.searchParams.has("x-amz-signature") ||
         (u.searchParams.has("X-Amz-Expires") && u.searchParams.has("X-Amz-Credential"))
       );
     } catch (e) { return false; }
+  }
+
+  /* ── media URL detection ── */
+  function isMediaUrl(url) {
+    try {
+      var u = new URL(url, location.href);
+      var host = u.hostname.toLowerCase();
+      var path = u.pathname.toLowerCase();
+      if (
+        /r2\\.cloudflarestorage\\.com$/.test(host) ||
+        /\\.r2\\.dev$/.test(host) ||
+        /cloudflarestream\\.com$/.test(host) ||
+        /qyshare\\.com$/.test(host)
+      ) return true;
+      if (/\\.(?:mp4|m3u8|ts|webm|mkv|mov|m4s|mp3|m4a|aac)(?:$|\\?)/.test(path)) return true;
+      return false;
+    } catch (e) { return false; }
+  }
+
+  function shouldRelay(url) {
+    return isSignedUrl(url) || isMediaUrl(url);
+  }
+
+  /* ── media-relay endpoint URL ── */
+  function toMediaUrl(url) {
+    try {
+      var u = new URL(url, location.href);
+      return MEDIA_BASE + "?url=" + encodeURIComponent(u.toString());
+    } catch (e) { return url; }
   }
 
   /* ── URL → Proxy URL ── */
@@ -751,16 +877,19 @@ function injectVideoPlayerPatch(html, incomingUrl) {
       t.startsWith("#")     || t.startsWith("javascript:")
     ) return url;
 
-    // same-origin path
-    if (t.startsWith("/") && !t.startsWith("//")) return url;
+    // already proxied
+    if (t.indexOf(MEDIA_BASE) === 0 || t.indexOf("/__media") === 0) return url;
+    if (t.indexOf(PROXY_BASE) === 0 || t.indexOf("/__proxy") === 0) return url;
 
     try {
       var u = new URL(t, location.href);
-      if (u.hostname === location.hostname) return url;
-      if (u.pathname === "/__proxy")         return url;
 
-      // ✅ signed URL → direct (proxy 経由しない)
-      if (isSignedUrl(u)) return u.toString();
+      // ✅ signed/media → media-relay endpoint (browser direct fail ဖြစ်လို့)
+      if (shouldRelay(u.toString())) return toMediaUrl(u.toString());
+
+      // same-origin path
+      if (t.startsWith("/") && !t.startsWith("//")) return url;
+      if (u.hostname === location.hostname) return url;
 
       return PROXY_BASE + "?url=" + encodeURIComponent(u.toString());
     } catch (e) { return url; }
@@ -791,19 +920,15 @@ function injectVideoPlayerPatch(html, incomingUrl) {
     var reqUrl = typeof input === "string" ? input
       : (input instanceof Request ? input.url : String(input));
 
-    // signed URL → proxy に通さない
-    if (!isSignedUrl(reqUrl)) {
-      reqUrl = toProxyUrl(reqUrl);
-    }
+    var newUrl = toProxyUrl(reqUrl);
 
     var res = await _fetch(
-      typeof input === "string" ? reqUrl : new Request(reqUrl, input),
+      typeof input === "string" ? newUrl : new Request(newUrl, input),
       init
     );
 
     var ct = res.headers.get("content-type") || "";
 
-    /* JSON response → deep-rewrite (signed URL 除く) */
     if (ct.includes("application/json") || ct.includes("text/json")) {
       var clone = res.clone();
       try {
@@ -824,8 +949,7 @@ function injectVideoPlayerPatch(html, incomingUrl) {
   XMLHttpRequest.prototype.open = function (method, url) {
     var rest = Array.prototype.slice.call(arguments, 2);
     try {
-      var proxied = isSignedUrl(String(url)) ? String(url) : toProxyUrl(String(url));
-      this._proxyUrl = proxied;
+      this._proxyUrl = toProxyUrl(String(url));
     } catch (e) { this._proxyUrl = url; }
     return _XHROpen.apply(this, [method, this._proxyUrl].concat(rest));
   };
@@ -833,22 +957,23 @@ function injectVideoPlayerPatch(html, incomingUrl) {
   /* ── DOM ready patches ── */
   document.addEventListener("DOMContentLoaded", function () {
 
-    /* MutationObserver — 動的 video/source 要素 */
+    function patchNodeAttrs(node) {
+      if (!node || !node.getAttribute) return;
+      ["src", "data-src", "poster"].forEach(function (attr) {
+        var val = node.getAttribute(attr);
+        if (val) {
+          var nu = toProxyUrl(val);
+          if (nu !== val) node.setAttribute(attr, nu);
+        }
+      });
+    }
+
     new MutationObserver(function (mutations) {
       mutations.forEach(function (m) {
         m.addedNodes.forEach(function (node) {
-          if (!node || !node.getAttribute) return;
-          ["src", "data-src", "poster"].forEach(function (attr) {
-            var val = node.getAttribute(attr);
-            if (val && !isSignedUrl(val)) node.setAttribute(attr, toProxyUrl(val));
-          });
+          patchNodeAttrs(node);
           if (node.querySelectorAll) {
-            node.querySelectorAll("[src],[data-src]").forEach(function (el) {
-              ["src", "data-src"].forEach(function (attr) {
-                var v = el.getAttribute(attr);
-                if (v && !isSignedUrl(v)) el.setAttribute(attr, toProxyUrl(v));
-              });
-            });
+            node.querySelectorAll("[src],[data-src],source,video").forEach(patchNodeAttrs);
           }
         });
       });
@@ -868,7 +993,7 @@ function injectVideoPlayerPatch(html, incomingUrl) {
             set: function (src) {
               if (src && Array.isArray(src.sources)) {
                 src.sources = src.sources.map(function (s) {
-                  if (s && s.src && !isSignedUrl(s.src)) s.src = toProxyUrl(s.src);
+                  if (s && s.src) s.src = toProxyUrl(s.src);
                   return s;
                 });
               }
@@ -879,7 +1004,6 @@ function injectVideoPlayerPatch(html, incomingUrl) {
       } catch (e) {}
     }
 
-    /* window.Plyr constructor override */
     if (window.Plyr) {
       var OrigPlyr = window.Plyr;
       window.Plyr  = function (target, opts) {
@@ -890,7 +1014,10 @@ function injectVideoPlayerPatch(html, incomingUrl) {
       Object.assign(window.Plyr, OrigPlyr);
     }
 
-    /* ── img pipe-src fix: src に | が残っていたら最初の部分だけ使う ── */
+    /* ── existing video/source elements patch ── */
+    document.querySelectorAll("video, source").forEach(patchNodeAttrs);
+
+    /* ── img pipe-src fix ── */
     document.querySelectorAll("img[src]").forEach(function (img) {
       var src = img.getAttribute("src");
       if (src && src.includes("|")) {
