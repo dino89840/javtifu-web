@@ -9,10 +9,6 @@ const ALLOWED_HOST_SUFFIXES = [
   `www.${TARGET_HOST}`
 ];
 
-/*
-  ⚠️ "onclick" ကို ဖယ်ထုတ်လိုက်ပါ — video player click event တွေ block မဖြစ်အောင်
-  ⚠️ "popup" ကို ဖယ်ထုတ်လိုက်ပါ — video player modal/lightbox တွေ hide မဖြစ်အောင်
-*/
 const AD_KEYWORDS = [
   "ads",
   "adserver",
@@ -39,9 +35,6 @@ const AD_KEYWORDS = [
   "outbrain"
 ];
 
-/*
-  data-lazy, data-srcset တွေပါ ထည့်ထားပါတယ် — lazy-load image တွေ ပြပါစေ
-*/
 const REWRITE_ATTRS = [
   "href",
   "src",
@@ -53,7 +46,6 @@ const REWRITE_ATTRS = [
   "data-original",
   "data-poster",
   "data-lazy",
-  "data-srcset",
   "data-image",
   "data-thumb"
 ];
@@ -135,10 +127,6 @@ export async function onRequest(context) {
     html = removeAdBlocksFromHtml(html);
     html = rewriteTextUrls(html, targetUrl, incomingUrl);
     html = injectAntiAdCss(html);
-    /*
-      Video player ကို proxy ကနေ boot လုပ်ဖို့ helper script inject
-      — jwplayer / videojs / hls.js source rewrite support
-    */
     html = injectVideoPlayerPatch(html, incomingUrl);
 
     const headers = buildResponseHeaders(upstreamResponse.headers, incomingUrl.host, true);
@@ -156,9 +144,6 @@ export async function onRequest(context) {
         new AttrRewriteHandler(targetUrl, incomingUrl)
       )
       .on("[style]", new StyleAttrRewriteHandler(targetUrl, incomingUrl))
-      /*
-        ✅ FIX: noscript ထဲမှာ ပုံ URL တွေ ပါတတ်တာကြောင့် rewrite လုပ်ပေး
-      */
       .on("noscript", new NoscriptRewriteHandler(targetUrl, incomingUrl))
       .transform(responseForRewrite);
   }
@@ -207,10 +192,7 @@ export async function onRequest(context) {
     pathname.endsWith(".json")
   ) {
     let text = await upstreamResponse.text();
-    /*
-      ✅ FIX: JS file ကို ad keyword check မလုပ်ခင်
-      video player script မဟုတ်ကြောင်း သေချာစစ်ပြီးမှ ad remove လုပ်
-    */
+
     if (!isVideoPlayerScript(targetUrl.pathname)) {
       text = removeAdCodeFromText(text);
     }
@@ -224,7 +206,7 @@ export async function onRequest(context) {
     });
   }
 
-  // ── Binary (images / video segments / mp4 / ts / webm) ───────────────────
+  // ── Binary ────────────────────────────────────────────────────────────────
   const headers = buildResponseHeaders(upstreamResponse.headers, incomingUrl.host, false);
 
   return new Response(upstreamResponse.body, {
@@ -339,10 +321,6 @@ function isRedirect(status) {
   return [301, 302, 303, 307, 308].includes(status);
 }
 
-/*
-  ✅ FIX: Video player library script တွေ မမှားဘဲ detect လုပ်ဖို့
-  jwplayer / videojs / hls.js / plyr / flowplayer path များ
-*/
 function isVideoPlayerScript(pathname) {
   const lower = pathname.toLowerCase();
   return (
@@ -494,6 +472,20 @@ class AttrRewriteHandler {
       const value = element.getAttribute(attr);
       if (!value) continue;
 
+      /*
+        ✅ FIX — pipe-separated dual URL format ကို handle
+        format: "https://full.jpg|/path/xs.jpg"
+        ပထမ URL ကိုသာ rewrite လုပ်ပြီး xs ကို path-only အဖြစ် ထားခဲ့
+      */
+      if (value.includes("|")) {
+        const parts = value.split("|");
+        const rewritten = parts.map((p) =>
+          rewriteOneUrl(p.trim(), this.baseTargetUrl, this.incomingUrl)
+        );
+        element.setAttribute(attr, rewritten.join("|"));
+        continue;
+      }
+
       element.setAttribute(
         attr,
         rewriteOneUrl(value, this.baseTargetUrl, this.incomingUrl)
@@ -508,12 +500,8 @@ class AttrRewriteHandler {
       );
     }
 
-    /*
-      ✅ FIX: loading="lazy" attribute ရှိတဲ့ img တွေ
-      browser က မဖတ်ခင် proxy URL ပြောင်းပေးထားပြီးသား ဖြစ်စေ
-    */
-    const loading = element.getAttribute("loading");
-    if (loading === "lazy") {
+    // lazy → eager
+    if (element.getAttribute("loading") === "lazy") {
       element.setAttribute("loading", "eager");
     }
   }
@@ -536,11 +524,6 @@ class StyleAttrRewriteHandler {
   }
 }
 
-/*
-  ✅ FIX: noscript ထဲမှာ ပုံ URL တွေ ပါတတ်
-  HTMLRewriter ဖြင့် inner HTML rewrite မဆောင်နိုင်လို့
-  text content ကို ဖတ်ပြီး replace လုပ်ပေးသည်
-*/
 class NoscriptRewriteHandler {
   constructor(baseTargetUrl, incomingUrl) {
     this.baseTargetUrl = baseTargetUrl;
@@ -551,7 +534,11 @@ class NoscriptRewriteHandler {
   text(chunk) {
     this.buffer += chunk.text;
     if (chunk.lastInTextNode) {
-      const rewritten = rewriteTextUrls(this.buffer, this.baseTargetUrl, this.incomingUrl);
+      const rewritten = rewriteTextUrls(
+        this.buffer,
+        this.baseTargetUrl,
+        this.incomingUrl
+      );
       chunk.replace(rewritten, { html: true });
       this.buffer = "";
     } else {
@@ -604,8 +591,12 @@ function rewriteCssUrls(css, baseTargetUrl, incomingUrl) {
 }
 
 function rewriteTextUrls(text, baseTargetUrl, incomingUrl) {
+  /*
+    ✅ FIX — pipe | char ကို URL boundary အဖြစ် သတ်မှတ်
+    "https://full.jpg|/xs.jpg" → နှစ်ပိုင်းသီးသန့် rewrite ဖြစ်စေ
+  */
   return text.replace(
-    /((?:https?:)?\/\/[^\s"'<>\\)]+)/gi,
+    /((?:https?:)?\/\/[^\s"'<>\\)|]+)/gi,
     (match) => {
       let raw = match;
 
@@ -647,10 +638,6 @@ function rewriteM3U8(playlist, baseTargetUrl, incomingUrl) {
       });
     }
 
-    /*
-      ✅ FIX: #EXT-X-MEDIA / #EXT-X-STREAM-INF ထဲမှာ URI= ပါတာကို rewrite
-      Multi-bitrate HLS stream တွေ proxy ကနေ pass ဖြစ်စေ
-    */
     if (trimmed.startsWith("#EXT-X-MEDIA") && trimmed.includes("URI=")) {
       return line.replace(/URI=(["'])(.*?)\1/i, (full, quote, uri) => {
         const rewrittenUri = rewriteOneUrl(uri, baseTargetUrl, incomingUrl);
@@ -675,10 +662,7 @@ function rewriteM3U8(playlist, baseTargetUrl, incomingUrl) {
 function removeAdBlocksFromHtml(html) {
   html = html.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, (block) => {
     const lower = block.toLowerCase();
-    /*
-      ✅ FIX: video player related script တွေ မဖျက်မိအောင်
-      src attribute ရှိတဲ့ external script ကိုသာ check
-    */
+
     if (
       lower.includes("jwplayer") ||
       lower.includes("videojs") ||
@@ -687,14 +671,19 @@ function removeAdBlocksFromHtml(html) {
     ) {
       return block;
     }
-    return AD_KEYWORDS.some((keyword) => lower.includes(keyword.toLowerCase()))
+
+    return AD_KEYWORDS.some((keyword) =>
+      lower.includes(keyword.toLowerCase())
+    )
       ? ""
       : block;
   });
 
   html = html.replace(/<iframe\b[^>]*>[\s\S]*?<\/iframe>/gi, (block) => {
     const lower = block.toLowerCase();
-    return AD_KEYWORDS.some((keyword) => lower.includes(keyword.toLowerCase()))
+    return AD_KEYWORDS.some((keyword) =>
+      lower.includes(keyword.toLowerCase())
+    )
       ? ""
       : block;
   });
@@ -743,65 +732,174 @@ iframe[src*="pop" i] {
 }
 
 /*
-  ✅ FIX: Video player ကို proxy-aware ဖြစ်စေဖို့ runtime patch inject
-  jwplayer / videojs setup call ထဲမှာ file/src URL တွေကို proxy URL ပြောင်းပေး
+  ✅ FIX — R2 Signed URL + Plyr runtime intercept
+  Site က JavaScript ထဲမှာ fetch() ခေါ်ပြီး video URL ရတာဖြစ်လို့
+  native fetch ကို override လုပ်ကာ response ထဲက URL တွေကို
+  proxy URL အဖြစ် ပြောင်းပေးသည်
 */
 function injectVideoPlayerPatch(html, incomingUrl) {
   const proxyBase = `${incomingUrl.protocol}//${incomingUrl.host}${PROXY_PATH}`;
 
   const patch = `
 <script>
-(function() {
+(function () {
   const PROXY_BASE = ${JSON.stringify(proxyBase)};
+  const TARGET_HOST = ${JSON.stringify(TARGET_HOST)};
 
+  /* ── URL → Proxy URL helper ── */
   function toProxyUrl(url) {
     if (!url || typeof url !== "string") return url;
-    if (url.startsWith("/") && !url.startsWith("//")) return url;
-    if (url.startsWith("blob:") || url.startsWith("data:")) return url;
+    const trimmed = url.trim();
+    if (
+      trimmed.startsWith("blob:") ||
+      trimmed.startsWith("data:") ||
+      trimmed.startsWith("#") ||
+      trimmed.startsWith("javascript:")
+    ) return url;
+
+    // same-origin path → pass through
+    if (trimmed.startsWith("/") && !trimmed.startsWith("//")) return url;
+
     try {
-      const u = new URL(url, location.href);
+      const u = new URL(trimmed, location.href);
+      // same hostname → pass through
       if (u.hostname === location.hostname) return url;
+      // already proxied
+      if (u.pathname === "/__proxy") return url;
       return PROXY_BASE + "?url=" + encodeURIComponent(u.toString());
-    } catch(e) {
+    } catch (e) {
       return url;
     }
   }
 
-  /* jwplayer patch */
-  const _jwplayer = window.jwplayer;
-  if (typeof _jwplayer !== "undefined") {
-    const origSetup = _jwplayer.prototype && _jwplayer.prototype.setup;
-    if (origSetup) {
-      _jwplayer.prototype.setup = function(config) {
-        if (config && config.file) config.file = toProxyUrl(config.file);
-        if (config && Array.isArray(config.sources)) {
-          config.sources = config.sources.map(function(s) {
-            if (s && s.file) s.file = toProxyUrl(s.file);
-            return s;
-          });
-        }
-        return origSetup.call(this, config);
-      };
+  /* ── JSON deep-walk: URL တန်ဖိုးတွေ rewrite ── */
+  function proxyJsonUrls(obj) {
+    if (typeof obj === "string") {
+      // pipe-separated dual URL format "full.jpg|xs.jpg"
+      if (obj.includes("|")) {
+        return obj.split("|").map(toProxyUrl).join("|");
+      }
+      return toProxyUrl(obj);
     }
+    if (Array.isArray(obj)) return obj.map(proxyJsonUrls);
+    if (obj && typeof obj === "object") {
+      const out = {};
+      for (const k of Object.keys(obj)) out[k] = proxyJsonUrls(obj[k]);
+      return out;
+    }
+    return obj;
   }
 
-  /* videojs / hls.js src patch via MutationObserver */
-  const observer = new MutationObserver(function(mutations) {
-    mutations.forEach(function(m) {
-      m.addedNodes.forEach(function(node) {
-        if (node.nodeName === "SOURCE" || node.nodeName === "VIDEO") {
-          ["src", "data-src"].forEach(function(attr) {
-            const val = node.getAttribute && node.getAttribute(attr);
+  /* ── fetch() override: JSON response ထဲက URL rewrite ── */
+  const _fetch = window.fetch.bind(window);
+  window.fetch = async function (input, init) {
+    // request URL ကို proxy ကနေ ဖြတ်
+    let reqUrl = typeof input === "string" ? input
+      : (input instanceof Request ? input.url : String(input));
+    reqUrl = toProxyUrl(reqUrl);
+
+    const res = await _fetch(
+      typeof input === "string"
+        ? reqUrl
+        : new Request(reqUrl, input),
+      init
+    );
+
+    const ct = res.headers.get("content-type") || "";
+
+    /* JSON response ဆိုရင် deep-rewrite */
+    if (ct.includes("application/json") || ct.includes("text/json")) {
+      const clone = res.clone();
+      try {
+        const json = await clone.json();
+        const patched = proxyJsonUrls(json);
+        return new Response(JSON.stringify(patched), {
+          status: res.status,
+          statusText: res.statusText,
+          headers: res.headers
+        });
+      } catch (e) {
+        return res;
+      }
+    }
+
+    return res;
+  };
+
+  /* ── XMLHttpRequest override ── */
+  const _XHROpen = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+    try {
+      this._proxyUrl = toProxyUrl(String(url));
+    } catch (e) {
+      this._proxyUrl = url;
+    }
+    return _XHROpen.call(this, method, this._proxyUrl, ...rest);
+  };
+
+  /* ── Plyr source set patch ── */
+  document.addEventListener("DOMContentLoaded", function () {
+
+    /* MutationObserver — video/source element inject ─ */
+    new MutationObserver(function (mutations) {
+      mutations.forEach(function (m) {
+        m.addedNodes.forEach(function (node) {
+          if (!node || !node.getAttribute) return;
+          ["src", "data-src", "poster"].forEach(function (attr) {
+            const val = node.getAttribute(attr);
             if (val) node.setAttribute(attr, toProxyUrl(val));
           });
-        }
+          /* child <source> တွေပါ စစ် */
+          if (node.querySelectorAll) {
+            node.querySelectorAll("[src],[data-src]").forEach(function (el) {
+              ["src", "data-src"].forEach(function (attr) {
+                const v = el.getAttribute(attr);
+                if (v) el.setAttribute(attr, toProxyUrl(v));
+              });
+            });
+          }
+        });
       });
-    });
+    }).observe(document.body, { childList: true, subtree: true });
+
+    /* ── Plyr instance property override ── */
+    function patchPlyrInstance(player) {
+      if (!player || player.__proxied) return;
+      player.__proxied = true;
+      try {
+        const origSource = Object.getOwnPropertyDescriptor(
+          Object.getPrototypeOf(player), "source"
+        );
+        if (origSource && origSource.set) {
+          const origSet = origSource.set.bind(player);
+          Object.defineProperty(player, "source", {
+            get: origSource.get ? origSource.get.bind(player) : undefined,
+            set: function (src) {
+              if (src && src.sources) {
+                src.sources = src.sources.map(function (s) {
+                  if (s && s.src) s.src = toProxyUrl(s.src);
+                  return s;
+                });
+              }
+              origSet(src);
+            }
+          });
+        }
+      } catch (e) {}
+    }
+
+    /* window.Plyr constructor override */
+    if (window.Plyr) {
+      const OrigPlyr = window.Plyr;
+      window.Plyr = function (target, opts) {
+        const instance = new OrigPlyr(target, opts);
+        patchPlyrInstance(instance);
+        return instance;
+      };
+      Object.assign(window.Plyr, OrigPlyr);
+    }
   });
 
-  document.addEventListener("DOMContentLoaded", function() {
-    observer.observe(document.body, { childList: true, subtree: true });
-  });
 })();
 </script>
 `;
