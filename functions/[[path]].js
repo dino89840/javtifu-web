@@ -2,27 +2,16 @@ const TARGET_HOST = "javtiful.com";
 const TARGET_ORIGIN = `https://${TARGET_HOST}`;
 const PROXY_PATH = "/__proxy";
 
-/*
-  Video/CDN URL တွေ proxy ကနေသွားစေဖို့ true ထားထားပါတယ်။
-  Production မှာ safer ဖြစ်ချင်ရင် false ထားပြီး ALLOWED_HOST_SUFFIXES ထဲ CDN domain တွေ ထည့်ပါ။
-*/
 const ALLOW_ANY_EXTERNAL_HOST = true;
 
-/*
-  ALLOW_ANY_EXTERNAL_HOST = false လုပ်မယ်ဆိုရင်
-  video CDN domain တွေကို ဒီထဲထည့်ပါ။
-  ဥပမာ:
-  "cdn.example.com",
-  "examplecdn.net"
-*/
 const ALLOWED_HOST_SUFFIXES = [
   TARGET_HOST,
   `www.${TARGET_HOST}`
 ];
 
 /*
-  Ads / popunder / tracker / analytics domain keyword များ
-  မပျောက်သေးတဲ့ ads ရှိရင် DevTools > Network ထဲက domain/keyword ကို ဒီထဲ ထပ်ထည့်ပါ။
+  ⚠️ "onclick" ကို ဖယ်ထုတ်လိုက်ပါ — video player click event တွေ block မဖြစ်အောင်
+  ⚠️ "popup" ကို ဖယ်ထုတ်လိုက်ပါ — video player modal/lightbox တွေ hide မဖြစ်အောင်
 */
 const AD_KEYWORDS = [
   "ads",
@@ -33,7 +22,6 @@ const AD_KEYWORDS = [
   "popads",
   "popcash",
   "popunder",
-  "onclick",
   "doubleclick",
   "googlesyndication",
   "google-analytics",
@@ -51,6 +39,9 @@ const AD_KEYWORDS = [
   "outbrain"
 ];
 
+/*
+  data-lazy, data-srcset တွေပါ ထည့်ထားပါတယ် — lazy-load image တွေ ပြပါစေ
+*/
 const REWRITE_ATTRS = [
   "href",
   "src",
@@ -60,7 +51,11 @@ const REWRITE_ATTRS = [
   "data-href",
   "data-url",
   "data-original",
-  "data-poster"
+  "data-poster",
+  "data-lazy",
+  "data-srcset",
+  "data-image",
+  "data-thumb"
 ];
 
 export async function onRequest(context) {
@@ -113,9 +108,6 @@ export async function onRequest(context) {
     });
   }
 
-  /*
-    Redirect Location ကိုလည်း proxy URL ပြန်ပြောင်းပေးရန်
-  */
   if (isRedirect(upstreamResponse.status)) {
     const location = upstreamResponse.headers.get("location");
     const headers = buildResponseHeaders(upstreamResponse.headers, incomingUrl.host, false);
@@ -136,15 +128,18 @@ export async function onRequest(context) {
   const contentType = upstreamResponse.headers.get("content-type") || "";
   const pathname = targetUrl.pathname.toLowerCase();
 
-  /*
-    HTML rewrite
-  */
+  // ── HTML ──────────────────────────────────────────────────────────────────
   if (contentType.includes("text/html")) {
     let html = await upstreamResponse.text();
 
     html = removeAdBlocksFromHtml(html);
     html = rewriteTextUrls(html, targetUrl, incomingUrl);
     html = injectAntiAdCss(html);
+    /*
+      Video player ကို proxy ကနေ boot လုပ်ဖို့ helper script inject
+      — jwplayer / videojs / hls.js source rewrite support
+    */
+    html = injectVideoPlayerPatch(html, incomingUrl);
 
     const headers = buildResponseHeaders(upstreamResponse.headers, incomingUrl.host, true);
     headers.set("content-type", "text/html; charset=UTF-8");
@@ -156,15 +151,19 @@ export async function onRequest(context) {
 
     return new HTMLRewriter()
       .on("script, iframe, embed, object", new RemoveAdElementHandler(targetUrl))
-      .on("a, link, img, script, iframe, source, video, audio, form, embed, object, track", new AttrRewriteHandler(targetUrl, incomingUrl))
+      .on(
+        "a, link, img, script, iframe, source, video, audio, form, embed, object, track",
+        new AttrRewriteHandler(targetUrl, incomingUrl)
+      )
       .on("[style]", new StyleAttrRewriteHandler(targetUrl, incomingUrl))
+      /*
+        ✅ FIX: noscript ထဲမှာ ပုံ URL တွေ ပါတတ်တာကြောင့် rewrite လုပ်ပေး
+      */
+      .on("noscript", new NoscriptRewriteHandler(targetUrl, incomingUrl))
       .transform(responseForRewrite);
   }
 
-  /*
-    HLS playlist / m3u8 rewrite
-    Video segments တွေ မူရင်း URL မသွားဘဲ proxy ကနေသွားစေဖို့ အရေးကြီးပါတယ်။
-  */
+  // ── HLS m3u8 ──────────────────────────────────────────────────────────────
   if (
     contentType.includes("application/vnd.apple.mpegurl") ||
     contentType.includes("application/x-mpegurl") ||
@@ -182,9 +181,7 @@ export async function onRequest(context) {
     });
   }
 
-  /*
-    CSS rewrite
-  */
+  // ── CSS ───────────────────────────────────────────────────────────────────
   if (contentType.includes("text/css") || pathname.endsWith(".css")) {
     let css = await upstreamResponse.text();
     css = rewriteCssUrls(css, targetUrl, incomingUrl);
@@ -199,9 +196,7 @@ export async function onRequest(context) {
     });
   }
 
-  /*
-    JS / JSON / XML / text ထဲက URL များ rewrite
-  */
+  // ── JS / JSON / XML / text ────────────────────────────────────────────────
   if (
     contentType.includes("javascript") ||
     contentType.includes("application/json") ||
@@ -212,7 +207,13 @@ export async function onRequest(context) {
     pathname.endsWith(".json")
   ) {
     let text = await upstreamResponse.text();
-    text = removeAdCodeFromText(text);
+    /*
+      ✅ FIX: JS file ကို ad keyword check မလုပ်ခင်
+      video player script မဟုတ်ကြောင်း သေချာစစ်ပြီးမှ ad remove လုပ်
+    */
+    if (!isVideoPlayerScript(targetUrl.pathname)) {
+      text = removeAdCodeFromText(text);
+    }
     text = rewriteTextUrls(text, targetUrl, incomingUrl);
 
     const headers = buildResponseHeaders(upstreamResponse.headers, incomingUrl.host, true);
@@ -223,10 +224,7 @@ export async function onRequest(context) {
     });
   }
 
-  /*
-    Images / video segments / mp4 / ts / webm စသည်တို့
-    binary response ဖြစ်လို့ body မပြင်ဘဲ headers သာ clean လုပ်ပြီး ပြန်ပေးသည်။
-  */
+  // ── Binary (images / video segments / mp4 / ts / webm) ───────────────────
   const headers = buildResponseHeaders(upstreamResponse.headers, incomingUrl.host, false);
 
   return new Response(upstreamResponse.body, {
@@ -288,18 +286,10 @@ function proxifyUrl(targetUrl, incomingUrl) {
     return "about:blank";
   }
 
-  /*
-    Main target domain ဖြစ်ရင် pretty path အနေနဲ့ same-origin သုံး
-    ဥပမာ https://javtiful.com/video/abc => /video/abc
-  */
   if (isTargetHost(u.hostname)) {
     return `${u.pathname}${u.search}${u.hash}`;
   }
 
-  /*
-    CDN / external media / third-party resource များ
-    proxy endpoint မှတဆင့် သွားစေ
-  */
   return `${PROXY_PATH}?url=${encodeURIComponent(u.toString())}`;
 }
 
@@ -349,6 +339,25 @@ function isRedirect(status) {
   return [301, 302, 303, 307, 308].includes(status);
 }
 
+/*
+  ✅ FIX: Video player library script တွေ မမှားဘဲ detect လုပ်ဖို့
+  jwplayer / videojs / hls.js / plyr / flowplayer path များ
+*/
+function isVideoPlayerScript(pathname) {
+  const lower = pathname.toLowerCase();
+  return (
+    lower.includes("jwplayer") ||
+    lower.includes("videojs") ||
+    lower.includes("video.js") ||
+    lower.includes("hls.js") ||
+    lower.includes("hlsjs") ||
+    lower.includes("plyr") ||
+    lower.includes("flowplayer") ||
+    lower.includes("mediaelement") ||
+    lower.includes("player")
+  );
+}
+
 /* =========================
    Headers
 ========================= */
@@ -356,9 +365,6 @@ function isRedirect(status) {
 function buildRequestHeaders(request, targetUrl) {
   const headers = new Headers(request.headers);
 
-  /*
-    Upstream fetch အတွက် မလိုအပ်/ပြဿနာဖြစ်နိုင်သော headers များဖယ်
-  */
   headers.delete("host");
   headers.delete("content-length");
   headers.delete("accept-encoding");
@@ -384,9 +390,6 @@ function buildRequestHeaders(request, targetUrl) {
 function buildResponseHeaders(upstreamHeaders, proxyHost, modifiedBody) {
   const headers = new Headers(upstreamHeaders);
 
-  /*
-    Proxy page ထဲ rewrite လုပ်ထားတာတွေ browser က block မလုပ်အောင်
-  */
   headers.delete("content-security-policy");
   headers.delete("content-security-policy-report-only");
   headers.delete("x-frame-options");
@@ -395,19 +398,12 @@ function buildResponseHeaders(upstreamHeaders, proxyHost, modifiedBody) {
   headers.delete("cross-origin-embedder-policy");
   headers.delete("cross-origin-resource-policy");
 
-  /*
-    Body modify လုပ်ထားရင် length/encoding မမှန်တော့လို့ ဖယ်
-  */
   if (modifiedBody) {
     headers.delete("content-length");
     headers.delete("content-encoding");
     headers.delete("etag");
   }
 
-  /*
-    Cookie domain mismatch မဖြစ်အောင် Domain attribute ကို ဖယ်ရန်
-    Browser က proxy domain အတွက် cookie သိမ်းနိုင်စေသည်။
-  */
   rewriteSetCookieHeaders(headers);
 
   const cors = corsHeaders();
@@ -430,9 +426,6 @@ function corsHeaders() {
 }
 
 function rewriteSetCookieHeaders(headers) {
-  /*
-    Cloudflare runtime မှာ getSetCookie ရရင် multiple Set-Cookie ကို handle လုပ်နိုင်သည်။
-  */
   if (typeof headers.getSetCookie === "function") {
     const cookies = headers.getSetCookie();
     headers.delete("set-cookie");
@@ -514,6 +507,15 @@ class AttrRewriteHandler {
         rewriteSrcset(srcset, this.baseTargetUrl, this.incomingUrl)
       );
     }
+
+    /*
+      ✅ FIX: loading="lazy" attribute ရှိတဲ့ img တွေ
+      browser က မဖတ်ခင် proxy URL ပြောင်းပေးထားပြီးသား ဖြစ်စေ
+    */
+    const loading = element.getAttribute("loading");
+    if (loading === "lazy") {
+      element.setAttribute("loading", "eager");
+    }
   }
 }
 
@@ -531,6 +533,30 @@ class StyleAttrRewriteHandler {
       "style",
       rewriteCssUrls(style, this.baseTargetUrl, this.incomingUrl)
     );
+  }
+}
+
+/*
+  ✅ FIX: noscript ထဲမှာ ပုံ URL တွေ ပါတတ်
+  HTMLRewriter ဖြင့် inner HTML rewrite မဆောင်နိုင်လို့
+  text content ကို ဖတ်ပြီး replace လုပ်ပေးသည်
+*/
+class NoscriptRewriteHandler {
+  constructor(baseTargetUrl, incomingUrl) {
+    this.baseTargetUrl = baseTargetUrl;
+    this.incomingUrl = incomingUrl;
+    this.buffer = "";
+  }
+
+  text(chunk) {
+    this.buffer += chunk.text;
+    if (chunk.lastInTextNode) {
+      const rewritten = rewriteTextUrls(this.buffer, this.baseTargetUrl, this.incomingUrl);
+      chunk.replace(rewritten, { html: true });
+      this.buffer = "";
+    } else {
+      chunk.remove();
+    }
   }
 }
 
@@ -557,37 +583,32 @@ function rewriteSrcset(srcset, baseTargetUrl, incomingUrl) {
 }
 
 function rewriteCssUrls(css, baseTargetUrl, incomingUrl) {
-  return css.replace(
-    /url\(\s*(['"]?)(.*?)\1\s*\)/gi,
-    (full, quote, rawUrl) => {
-      const value = rawUrl.trim();
-      if (!value) return full;
+  return css
+    .replace(
+      /url\(\s*(['"]?)(.*?)\1\s*\)/gi,
+      (full, quote, rawUrl) => {
+        const value = rawUrl.trim();
+        if (!value) return full;
 
-      const rewritten = rewriteOneUrl(value, baseTargetUrl, incomingUrl);
-      return `url("${rewritten}")`;
-    }
-  ).replace(
-    /@import\s+(['"])(.*?)\1/gi,
-    (full, quote, rawUrl) => {
-      const rewritten = rewriteOneUrl(rawUrl, baseTargetUrl, incomingUrl);
-      return `@import "${rewritten}"`;
-    }
-  );
+        const rewritten = rewriteOneUrl(value, baseTargetUrl, incomingUrl);
+        return `url("${rewritten}")`;
+      }
+    )
+    .replace(
+      /@import\s+(['"])(.*?)\1/gi,
+      (full, quote, rawUrl) => {
+        const rewritten = rewriteOneUrl(rawUrl, baseTargetUrl, incomingUrl);
+        return `@import "${rewritten}"`;
+      }
+    );
 }
 
 function rewriteTextUrls(text, baseTargetUrl, incomingUrl) {
-  /*
-    JS / HTML / JSON ထဲမှာပါတဲ့ absolute URL များ rewrite
-    ဥပမာ https://cdn.xxx/video.m3u8 => /__proxy?url=...
-  */
   return text.replace(
     /((?:https?:)?\/\/[^\s"'<>\\)]+)/gi,
     (match) => {
       let raw = match;
 
-      /*
-        URL နောက်က punctuation ပါလာရင် ခွဲထုတ်
-      */
       let tail = "";
       while (/[.,;!?]$/.test(raw)) {
         tail = raw.slice(-1) + tail;
@@ -619,10 +640,6 @@ function rewriteM3U8(playlist, baseTargetUrl, incomingUrl) {
 
     if (!trimmed) return line;
 
-    /*
-      #EXT-X-KEY:METHOD=AES-128,URI="key.key"
-      Key URI ကိုလည်း proxy rewrite
-    */
     if (trimmed.startsWith("#EXT-X-KEY") && trimmed.includes("URI=")) {
       return line.replace(/URI=(["'])(.*?)\1/i, (full, quote, uri) => {
         const rewrittenUri = rewriteOneUrl(uri, baseTargetUrl, incomingUrl);
@@ -631,8 +648,16 @@ function rewriteM3U8(playlist, baseTargetUrl, incomingUrl) {
     }
 
     /*
-      Comment / metadata line မဟုတ်ရင် segment URL ဖြစ်နိုင်
+      ✅ FIX: #EXT-X-MEDIA / #EXT-X-STREAM-INF ထဲမှာ URI= ပါတာကို rewrite
+      Multi-bitrate HLS stream တွေ proxy ကနေ pass ဖြစ်စေ
     */
+    if (trimmed.startsWith("#EXT-X-MEDIA") && trimmed.includes("URI=")) {
+      return line.replace(/URI=(["'])(.*?)\1/i, (full, quote, uri) => {
+        const rewrittenUri = rewriteOneUrl(uri, baseTargetUrl, incomingUrl);
+        return `URI=${quote}${rewrittenUri}${quote}`;
+      });
+    }
+
     if (!trimmed.startsWith("#")) {
       return rewriteOneUrl(trimmed, baseTargetUrl, incomingUrl);
     }
@@ -648,19 +673,25 @@ function rewriteM3U8(playlist, baseTargetUrl, incomingUrl) {
 ========================= */
 
 function removeAdBlocksFromHtml(html) {
-  /*
-    Ads keyword ပါတဲ့ script block များဖယ်
-  */
   html = html.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, (block) => {
     const lower = block.toLowerCase();
+    /*
+      ✅ FIX: video player related script တွေ မဖျက်မိအောင်
+      src attribute ရှိတဲ့ external script ကိုသာ check
+    */
+    if (
+      lower.includes("jwplayer") ||
+      lower.includes("videojs") ||
+      lower.includes("hls.js") ||
+      lower.includes("plyr")
+    ) {
+      return block;
+    }
     return AD_KEYWORDS.some((keyword) => lower.includes(keyword.toLowerCase()))
       ? ""
       : block;
   });
 
-  /*
-    Ads keyword ပါတဲ့ iframe များဖယ်
-  */
   html = html.replace(/<iframe\b[^>]*>[\s\S]*?<\/iframe>/gi, (block) => {
     const lower = block.toLowerCase();
     return AD_KEYWORDS.some((keyword) => lower.includes(keyword.toLowerCase()))
@@ -675,12 +706,11 @@ function removeAdCodeFromText(text) {
   const lower = text.toLowerCase();
 
   if (AD_KEYWORDS.some((keyword) => lower.includes(keyword.toLowerCase()))) {
-    /*
-      JS file တစ်ခုလုံး ad network ဖြစ်နိုင်ရင် empty ပြန်
-      အလွန် aggressive မဖြစ်စေရန် full remove မလုပ်ဘဲ common pop calls များဖယ်
-    */
     text = text.replace(/window\.open\s*\([^)]*\)\s*;?/gi, "");
-    text = text.replace(/document\.write\s*\([^)]*(ads|pop|iframe)[^)]*\)\s*;?/gi, "");
+    text = text.replace(
+      /document\.write\s*\([^)]*(ads|pop|iframe)[^)]*\)\s*;?/gi,
+      ""
+    );
   }
 
   return text;
@@ -689,11 +719,10 @@ function removeAdCodeFromText(text) {
 function injectAntiAdCss(html) {
   const css = `
 <style>
-[id*="ad" i],
-[class*="ad-" i],
-[class*="ads" i],
-[class*="banner" i],
-[class*="popup" i],
+[id*="ad" i]:not(video):not([id*="load"]):not([id*="head"]):not([id*="read"]):not([id*="broad"]):not([id*="lead"]):not([id*="trad"]),
+[class*="ad-" i]:not([class*="load"]):not([class*="head"]):not([class*="read"]),
+[class*="ads" i]:not([class*="loads"]):not([class*="heads"]):not([class*="reads"]),
+[class*="banner" i]:not([class*="banner-title"]),
 [class*="popunder" i],
 [class*="sponsor" i],
 iframe[src*="ads" i],
@@ -711,4 +740,75 @@ iframe[src*="pop" i] {
   }
 
   return css + html;
+}
+
+/*
+  ✅ FIX: Video player ကို proxy-aware ဖြစ်စေဖို့ runtime patch inject
+  jwplayer / videojs setup call ထဲမှာ file/src URL တွေကို proxy URL ပြောင်းပေး
+*/
+function injectVideoPlayerPatch(html, incomingUrl) {
+  const proxyBase = `${incomingUrl.protocol}//${incomingUrl.host}${PROXY_PATH}`;
+
+  const patch = `
+<script>
+(function() {
+  const PROXY_BASE = ${JSON.stringify(proxyBase)};
+
+  function toProxyUrl(url) {
+    if (!url || typeof url !== "string") return url;
+    if (url.startsWith("/") && !url.startsWith("//")) return url;
+    if (url.startsWith("blob:") || url.startsWith("data:")) return url;
+    try {
+      const u = new URL(url, location.href);
+      if (u.hostname === location.hostname) return url;
+      return PROXY_BASE + "?url=" + encodeURIComponent(u.toString());
+    } catch(e) {
+      return url;
+    }
+  }
+
+  /* jwplayer patch */
+  const _jwplayer = window.jwplayer;
+  if (typeof _jwplayer !== "undefined") {
+    const origSetup = _jwplayer.prototype && _jwplayer.prototype.setup;
+    if (origSetup) {
+      _jwplayer.prototype.setup = function(config) {
+        if (config && config.file) config.file = toProxyUrl(config.file);
+        if (config && Array.isArray(config.sources)) {
+          config.sources = config.sources.map(function(s) {
+            if (s && s.file) s.file = toProxyUrl(s.file);
+            return s;
+          });
+        }
+        return origSetup.call(this, config);
+      };
+    }
+  }
+
+  /* videojs / hls.js src patch via MutationObserver */
+  const observer = new MutationObserver(function(mutations) {
+    mutations.forEach(function(m) {
+      m.addedNodes.forEach(function(node) {
+        if (node.nodeName === "SOURCE" || node.nodeName === "VIDEO") {
+          ["src", "data-src"].forEach(function(attr) {
+            const val = node.getAttribute && node.getAttribute(attr);
+            if (val) node.setAttribute(attr, toProxyUrl(val));
+          });
+        }
+      });
+    });
+  });
+
+  document.addEventListener("DOMContentLoaded", function() {
+    observer.observe(document.body, { childList: true, subtree: true });
+  });
+})();
+</script>
+`;
+
+  if (html.includes("<head>")) {
+    return html.replace("<head>", `<head>${patch}`);
+  }
+
+  return patch + html;
 }
